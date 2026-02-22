@@ -378,13 +378,18 @@ class WelcomeOverlay(MainControlsMixin, QtWidgets.QWidget):
     def resizeEvent(self, event):
         """Resize and re-center floating widget when overlay is resized."""
         super().resizeEvent(event)
-        if hasattr(self, 'floating_widget'):
-            pw, ph = self.width(), self.height()
-            pref = getattr(self, '_preferred_float_size', self.floating_widget.size())
-            fw = min(pref.width(), pw)
-            fh = min(pref.height(), ph)
-            self.floating_widget.resize(fw, fh)
-            self._center_floating_widget()
+        try:
+            if hasattr(self, 'floating_widget') and self.floating_widget is not None:
+                pw, ph = self.width(), self.height()
+                if pw > 0 and ph > 0:  # Only resize if parent has valid size
+                    pref = getattr(self, '_preferred_float_size', self.floating_widget.size())
+                    fw = min(pref.width(), pw)
+                    fh = min(pref.height(), ph)
+                    if fw > 0 and fh > 0:  # Only apply valid sizes
+                        self.floating_widget.resize(fw, fh)
+                        self._center_floating_widget()
+        except Exception:
+            pass
 
     def _on_browse(self):
         """Open file dialog to browse and insert images."""

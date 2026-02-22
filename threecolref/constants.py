@@ -15,9 +15,9 @@
 
 APPNAME = '3ColRef'
 APPNAME_FULL = f'{APPNAME} Reference Image Viewer'
-VERSION = '0.3.4-dev'
-WEBSITE = 'https://github.com/rbreu/threecolref'
-COPYRIGHT = 'Copyright © 2021-2024 Rebecca Breu'
+VERSION = '1.0.0'
+WEBSITE = 'https://github.com/Luohino/threecolref'
+COPYRIGHT = 'Copyright © 2024-2026 Luohino'
 
 EXTENSION = '.3col'
 FILE_TYPE_NAME = f'{APPNAME} Scene'

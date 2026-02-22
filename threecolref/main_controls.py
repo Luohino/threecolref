@@ -16,7 +16,7 @@
 import logging
 
 from PyQt6 import QtCore, QtGui
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QUrl
 
 from threecolref import commands
 from threecolref.items import BeePixmapItem
@@ -89,119 +89,137 @@ class MainControlsMixin:
         event.acceptProposedAction()
 
     def dropEvent(self, event):
-        mimedata = event.mimeData()
-        logger.debug(f'Handling file drop: {mimedata.formats()}')
-        pos = QtCore.QPoint(round(event.position().x()),
-                            round(event.position().y()))
+        try:
+            mimedata = event.mimeData()
+            logger.debug(f'Handling file drop: {mimedata.formats()}')
+            pos = QtCore.QPoint(round(event.position().x()),
+                                round(event.position().y()))
 
-        # 1. Direct image data from clipboard/drag (most reliable)
-        if mimedata.hasImage():
-            img = QtGui.QImage(mimedata.imageData())
-            item = BeePixmapItem(img)
-            pos = self.control_target.mapToScene(pos)
-            self.control_target.undo_stack.push(
-                commands.InsertItems(self.control_target.scene, [item], pos))
-            return
-
-        # 2. When a browser drags content it sends text/html with the actual
-        #    <img src="..."> already resolved — extract that directly
-        if mimedata.hasHtml():
-            html = mimedata.html()
-            logger.debug(f'Browser HTML mimedata: {html[:200]}')
-            img_url = self._extract_img_src_from_html(html)
-            if img_url:
-                logger.debug(f'Found image URL in HTML mimedata: {img_url}')
-                from threecolref import widgets
-                widgets.BeeNotification(
-                    self.control_target, '🔗 Fetching image from the web…')
-                from PyQt6.QtWidgets import QApplication
-                QApplication.processEvents()
-                self.control_target.do_insert_images([QUrl(img_url)], pos)
-                return
-
-        # 3. URL list (file paths or web URLs)
-        if mimedata.hasUrls():
-            logger.debug(f'Found dropped urls: {mimedata.urls()}')
-            
-            # Check for project file (.3col / .bee) drop first
-            first_url = mimedata.urls()[0]
-            if first_url.isLocalFile():
-                local_path = first_url.toLocalFile()
-                if fileio.is_bee_file(local_path):
-                    if not self.control_target.scene.items():
-                        self.control_target.open_from_file(local_path)
-                    else:
-                        # Use method with unsaved confirmation
-                        self.control_target.on_action_open_recent_file(local_path)
+            # 1. Direct image data from clipboard/drag (most reliable)
+            if mimedata.hasImage():
+                try:
+                    img = QtGui.QImage(mimedata.imageData())
+                    item = BeePixmapItem(img)
+                    pos = self.control_target.mapToScene(pos)
+                    self.control_target.undo_stack.push(
+                        commands.InsertItems(self.control_target.scene, [item], pos))
                     return
-            web_urls = [u for u in mimedata.urls() if not u.isLocalFile()]
-            if web_urls:
-                from threecolref import widgets
-                widgets.BeeNotification(
-                    self.control_target, '🔗 Fetching from the web…')
-                from PyQt6.QtWidgets import QApplication
-                QApplication.processEvents()
-            
-            # Separate by file type — ignore non-media files (scripts, folders, etc.)
-            video_exts = ('.mp4', '.mkv', '.webm', '.avi', '.mov', '.wmv', '.flv', '.m4v')
-            image_exts = ('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp',
-                          '.tiff', '.tif', '.avif', '.svg', '.ico', '.icns')
+                except Exception as e:
+                    logger.error(f'Error handling image drag: {e}', exc_info=True)
+                    return
 
-            video_urls = []
-            image_urls = []
+            # 2. When a browser drags content it sends text/html with the actual
+            #    <img src="..."> already resolved — extract that directly
+            if mimedata.hasHtml():
+                try:
+                    html = mimedata.html()
+                    logger.debug(f'Browser HTML mimedata: {html[:200]}')
+                    img_url = self._extract_img_src_from_html(html)
+                    if img_url:
+                        logger.debug(f'Found image URL in HTML mimedata: {img_url}')
+                        from threecolref import widgets
+                        widgets.BeeNotification(
+                            self.control_target, '🔗 Fetching image from the web…')
+                        from PyQt6.QtWidgets import QApplication
+                        QApplication.processEvents()
+                        self.control_target.do_insert_images([QUrl(img_url)], pos)
+                        return
+                except Exception as e:
+                    logger.error(f'Error handling HTML drag: {e}', exc_info=True)
 
-            for u in mimedata.urls():
-                url_str = u.toString().lower()
-                path_str = u.toLocalFile().lower() if u.isLocalFile() else url_str
-                
-                # Check for video extensions (local or web)
-                is_video = any(path_str.endswith(ext) for ext in video_exts)
-                
-                # Special cases for popular video sites and their thumbnails
-                if not is_video:
-                    if any(x in url_str for x in ('youtube.com/watch', 'youtu.be/', 'youtube.com/embed')):
-                        is_video = True
-                    elif any(x in url_str for x in ('vimeo.com/', 'player.vimeo.com')):
-                        is_video = True
-                    elif 'i.ytimg.com' in url_str: # YouTube thumbnails
-                        is_video = True
-                    elif 'i.vimeocdn.com' in url_str: # Vimeo thumbnails
-                        is_video = True
-                
-                if is_video:
-                    video_urls.append(u)
-                else:
-                    # Treat everything else as potential image (filters non-media later)
-                    if not u.isLocalFile() or path_str.endswith(image_exts):
-                        image_urls.append(u)
+            # 3. URL list (file paths or web URLs)
+            if mimedata.hasUrls():
+                try:
+                    logger.debug(f'Found dropped urls: {mimedata.urls()}')
+                    
+                    # Check for project file (.3col / .bee) drop first
+                    first_url = mimedata.urls()[0]
+                    if first_url.isLocalFile():
+                        local_path = first_url.toLocalFile()
+                        if fileio.is_bee_file(local_path):
+                            if not self.control_target.scene.items():
+                                self.control_target.open_from_file(local_path)
+                            else:
+                                # Use method with unsaved confirmation
+                                self.control_target.on_action_open_recent_file(local_path)
+                            return
+                    web_urls = [u for u in mimedata.urls() if not u.isLocalFile()]
+                    if web_urls:
+                        from threecolref import widgets
+                        widgets.BeeNotification(
+                            self.control_target, '🔗 Fetching from the web…')
+                        from PyQt6.QtWidgets import QApplication
+                        QApplication.processEvents()
+                    
+                    # Separate by file type — ignore non-media files (scripts, folders, etc.)
+                    video_exts = ('.mp4', '.mkv', '.webm', '.avi', '.mov', '.wmv', '.flv', '.m4v')
+                    image_exts = ('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp',
+                                  '.tiff', '.tif', '.avif', '.svg', '.ico', '.icns')
 
-            if video_urls:
-                from threecolref import widgets
-                widgets.BeeNotification(
-                    self.control_target, 'Loading video...')
-                from PyQt6.QtWidgets import QApplication
-                QApplication.processEvents()
-                self.control_target.do_insert_videos(video_urls, pos)
-            if image_urls:
-                self.control_target.do_insert_images(image_urls, pos)
-            return
+                    video_urls = []
+                    image_urls = []
 
-        # 4. Plain text that could be an image or video URL
-        if mimedata.hasText():
-            text = mimedata.text().strip()
-            if text.startswith('http') and any(
-                    text.lower().endswith(ext)
-                    for ext in ('.jpg', '.jpeg', '.png', '.webp', '.gif',
-                                '.bmp', '.tiff', '.avif')):
-                from threecolref import widgets
-                widgets.BeeNotification(
-                    self.control_target, '🔗 Fetching image from the web…')
-                from PyQt6.QtWidgets import QApplication
-                QApplication.processEvents()
-                self.control_target.do_insert_images([QUrl(text)], pos)
-                return
+                    for u in mimedata.urls():
+                        url_str = u.toString().lower()
+                        path_str = u.toLocalFile().lower() if u.isLocalFile() else url_str
+                        
+                        # Check for video extensions (local or web)
+                        is_video = any(path_str.endswith(ext) for ext in video_exts)
+                        
+                        # Special cases for popular video sites and their thumbnails
+                        if not is_video:
+                            if any(x in url_str for x in ('youtube.com/watch', 'youtu.be/', 'youtube.com/embed')):
+                                is_video = True
+                            elif any(x in url_str for x in ('vimeo.com/', 'player.vimeo.com')):
+                                is_video = True
+                            elif 'i.ytimg.com' in url_str: # YouTube thumbnails
+                                is_video = True
+                            elif 'i.vimeocdn.com' in url_str: # Vimeo thumbnails
+                                is_video = True
+                        
+                        if is_video:
+                            video_urls.append(u)
+                        else:
+                            # Treat everything else as potential image (filters non-media later)
+                            if not u.isLocalFile() or path_str.endswith(image_exts):
+                                image_urls.append(u)
 
-        logger.info('Drop not an image')
+                    if video_urls:
+                        from threecolref import widgets
+                        widgets.BeeNotification(
+                            self.control_target, 'Loading video...')
+                        from PyQt6.QtWidgets import QApplication
+                        QApplication.processEvents()
+                        self.control_target.do_insert_videos(video_urls, pos)
+                    if image_urls:
+                        self.control_target.do_insert_images(image_urls, pos)
+                    return
+                except Exception as e:
+                    logger.error(f'Error handling URL drop: {e}', exc_info=True)
+                    return
+
+            # 4. Plain text that could be an image or video URL
+            if mimedata.hasText():
+                try:
+                    text = mimedata.text().strip()
+                    if text.startswith('http') and any(
+                            text.lower().endswith(ext)
+                            for ext in ('.jpg', '.jpeg', '.png', '.webp', '.gif',
+                                        '.bmp', '.tiff', '.avif')):
+                        from threecolref import widgets
+                        widgets.BeeNotification(
+                            self.control_target, '🔗 Fetching image from the web…')
+                        from PyQt6.QtWidgets import QApplication
+                        QApplication.processEvents()
+                        self.control_target.do_insert_images([QUrl(text)], pos)
+                        return
+                except Exception as e:
+                    logger.error(f'Error handling text drag: {e}', exc_info=True)
+                    return
+
+            logger.info('Drop not an image')
+        except Exception as e:
+            logger.error(f'Unexpected error in dropEvent: {e}', exc_info=True)
 
     def _extract_img_src_from_html(self, html):
         """Extract the first image src from HTML string (browser drag data)."""

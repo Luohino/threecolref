@@ -1326,19 +1326,32 @@ class BeeGraphicsView(MainControlsMixin,
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self.recalc_scene_rect()
-        if hasattr(self, 'welcome_overlay'):
-            self.welcome_overlay.resize(self.size())
-            # Re-center floating widget if visible
-            if self.welcome_overlay.isVisible() and hasattr(self.welcome_overlay, 'floating_widget'):
-                parent_rect = self.rect()
-                widget_rect = self.welcome_overlay.floating_widget.geometry()
-                x = (parent_rect.width() - widget_rect.width()) // 2
-                y = (parent_rect.height() - widget_rect.height()) // 2
-                self.welcome_overlay.floating_widget.move(x, y)
-        if hasattr(self, '_hierarchy_overlay') and self._hierarchy_overlay is not None:
-            self._hierarchy_overlay.update_position()
-        self.update_watermark_pos()
+        try:
+            self.recalc_scene_rect()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'welcome_overlay') and self.welcome_overlay is not None:
+                self.welcome_overlay.resize(self.size())
+                # Re-center floating widget if visible
+                if self.welcome_overlay.isVisible() and hasattr(self.welcome_overlay, 'floating_widget'):
+                    parent_rect = self.rect()
+                    widget_rect = self.welcome_overlay.floating_widget.geometry()
+                    x = (parent_rect.width() - widget_rect.width()) // 2
+                    y = (parent_rect.height() - widget_rect.height()) // 2
+                    self.welcome_overlay.floating_widget.move(x, y)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, '_hierarchy_overlay') and self._hierarchy_overlay is not None:
+                if hasattr(self._hierarchy_overlay, 'update_position'):
+                    self._hierarchy_overlay.update_position()
+        except Exception:
+            pass
+        try:
+            self.update_watermark_pos()
+        except Exception:
+            pass
 
     def init_watermark(self):
         # Watermark removed per user request
