@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=3ColRef
+GenericName=Image Viewer
+Comment=A simple reference image viewer
+Terminal=false
+Exec=threecolref
+Type=Application
+Icon=logo
+MimeType=application/x-threecolref;
+Categories=Qt;KDE;Graphics;
+X-KDE-NativeMimeType=application/x-threecolref
+X-KDE-ExtraNativeMimeTypes=
