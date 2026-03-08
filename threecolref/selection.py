@@ -35,8 +35,8 @@ SELECT_COLOR = QtGui.QColor(*COLORS['Scene:Selection'])
 
 
 # Hit test bias: how many pixels of the handle stay "inside" the bounding box.
-# The rest is biased outwards to preserve the image center.
-INTERACT_INSIDE_MARGIN = 19
+# Balanced: 15px inside, 15px outside for high-response border hits (30px total gutter).
+INTERACT_INSIDE_MARGIN = 15
 
 
 def with_anchor(func):
@@ -56,6 +56,24 @@ def with_anchor(func):
                 args = args[:-1]
 
         anchor = anchor or QtCore.QPointF(0, 0)
+        
+        # FIGMA-STYLE SYNC: Bypass anchor preservation if this change is coming 
+        # from a remote peer. Remote updates use absolute scene coordinates; 
+        # forcing an anchor reposition here causes "drift" or "jumping".
+        is_remote = False
+        try:
+            if hasattr(self, 'scene') and self.scene():
+                for view in self.scene().views():
+                    if hasattr(view, 'collab') and view.collab.applying_remote:
+                        is_remote = True
+                        break
+        except Exception:
+            pass
+
+        if is_remote:
+            func(self, *args, **kwargs)
+            return
+
         prev = self.mapToScene(anchor)
         func(self, *args, **kwargs)
         diff = self.mapToScene(anchor) - prev
@@ -78,12 +96,21 @@ class BaseItemMixin:
     def setZValue(self, value):
         logger.debug(f'Setting z-value for {self} to {value}')
         super().setZValue(value)
-        if self.scene():
-            self.scene().max_z = max(self.scene().max_z, value)
-            self.scene().min_z = min(self.scene().min_z, value)
+        # FIGMA-STYLE LAYERING: Parented items (doodles) can go behind parent image
+        if self.parentItem():
+            flag = QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemStacksBehindParent
+            self.setFlag(flag, value < 0)
 
     def bring_to_front(self):
-        self.setZValue(self.scene().max_z + self.scene().Z_STEP)
+        if self.parentItem():
+            siblings = self.parentItem().childItems()
+            sib_z = [s.zValue() for s in siblings]
+            z_step = 0.001
+            if self.scene():
+                z_step = self.scene().Z_STEP
+            self.setZValue(max(0.001, max(sib_z) if sib_z else 0.001) + z_step)
+        else:
+            self.setZValue(self.scene().max_z + self.scene().Z_STEP)
 
     @with_anchor
     def setRotation(self, value):
@@ -104,7 +131,8 @@ class BaseItemMixin:
             self.setRotation(self.rotation() + 180)
 
     def bounding_rect_unselected(self):
-        return super().boundingRect()
+        """Must be overridden by subclasses to return raw geometry without calling super().boundingRect()."""
+        raise NotImplementedError("Subclasses must implement bounding_rect_unselected using raw data.")
 
     @property
     def width(self):
@@ -126,12 +154,26 @@ class BaseItemMixin:
     def set_cursor(self, cursor):
         # Can't use setCursor on the item itself because of bug
         # https://bugreports.qt.io/browse/QTBUG-4190
+        
+        # Guard against redundant cursor updates which can cause RecursionError
+        # during high-frequency events like HoverMove
+        if not hasattr(self, '_current_cursor_shape'):
+            self._current_cursor_shape = None
+            
+        new_shape = cursor.shape() if isinstance(cursor, QtGui.QCursor) else cursor
+        if self._current_cursor_shape == new_shape:
+            return
+            
+        self._current_cursor_shape = new_shape
         if self.scene():
             self.scene().cursor_changed.emit(cursor)
 
     def unset_cursor(self):
         # Can't use unsetCursor on the item itself because of bug
         # https://bugreports.qt.io/browse/QTBUG-4190
+        if getattr(self, '_current_cursor_shape', None) is None:
+            return
+        self._current_cursor_shape = None
         if self.scene():
             self.scene().cursor_cleared.emit()
 
@@ -142,9 +184,9 @@ class BaseItemMixin:
 class SelectableMixin(BaseItemMixin):
     """Common code for selectable items: Selection outline, handles etc."""
 
-    SELECT_LINE_WIDTH = 4  # line width for the selection box
-    SELECT_HANDLE_SIZE = 10  # subtle selection handles for scaling (pixels on screen)
-    SELECT_RESIZE_SIZE = 20  # effortless "Goldilocks" hit zone (pixels on screen)
+    SELECT_LINE_WIDTH = 2  # cleaner, thinner line
+    SELECT_HANDLE_SIZE = 8  # sharp, subtle scaling handles
+    SELECT_RESIZE_SIZE = 10  # High-response hit zone (30px total gutter)
     SELECT_ROTATE_SIZE = 10  # hover area for rotating just outside corners
     SELECT_ROTATE_OFFSET = 30 # vertical distance of the rotation handle from top edge
     SELECT_ROTATE_HANDLE_SIZE = 15 # size of the modern rotation handle
@@ -168,14 +210,18 @@ class SelectableMixin(BaseItemMixin):
         screen so we need to adjust the values according to the scale
         factor sof the view and the item."""
 
-        if self.scene():
+        if self.scene() and self.scene().views():
             scale = self.scene().views()[0].get_scale()
             self._view_scale = scale
 
         # It can happen that the item is already removed from
         # the scene but its boundingRect is still needed. Keep the
         # last known scaling factor for that case
-        return value / getattr(self, '_view_scale', 1) / self.scale()
+        val = value / getattr(self, '_view_scale', 1) / self.scale()
+        # No clamping allowed! Clamping causes the on-screen hit zone to explode when 
+        # zoomed in and shrink when zoomed out. Mathematical val scaling perfectly preserves 
+        # exactly the desired screen-pixel dimension at any zoom.
+        return val
 
     @property
     def select_resize_size(self):
@@ -214,10 +260,6 @@ class SelectableMixin(BaseItemMixin):
         for pt in self.all_point_handles:
             if self.get_scale_bounds(pt, margin=self.select_resize_size/2).contains(pos):
                 return True
-
-        # Hit test for rotation handle (modern)
-        if self.get_rotate_handle_bounds().contains(pos):
-            return True
 
         # Hit test for the entire bounding border path (edges + corners)
         if self.get_edge_scale_path().contains(pos):
@@ -274,28 +316,8 @@ class SelectableMixin(BaseItemMixin):
             for pt in self.edge_midpoints:
                 painter.drawEllipse(pt, r, r)
 
-        # Draw modern rotation handle
-        if self.has_selection_outline():
-            painter.setPen(pen)
-            r_box = self.bounding_rect_unselected()
-            top_center = QtCore.QPointF(r_box.center().x(), r_box.top())
-            handle_pos = self.get_rotate_handle_pos()
-            
-            # Draw connecting line
-            painter.drawLine(top_center, handle_pos)
-            
-            # Draw handle circle
-            painter.setBrush(QtGui.QBrush(SELECT_COLOR))
-            painter.setPen(Qt.PenStyle.NoPen)
-            hr = self.fixed_length_for_viewport(self.SELECT_ROTATE_HANDLE_SIZE) / 2
-            painter.drawEllipse(handle_pos, hr, hr)
-            
-            # Draw SVG icon centered on handle
-            svg_renderer = BeeAssets().icon_rotate_svg
-            if svg_renderer.isValid():
-                icon_r = hr * 0.7  # Scale icon to fit inside handle
-                icon_rect = QtCore.QRectF(handle_pos.x() - icon_r, handle_pos.y() - icon_r, icon_r * 2, icon_r * 2)
-                svg_renderer.render(painter, icon_rect)
+        # Rotation handle removed for PureRef-style Ctrl+Drag interaction
+        pass
 
     @property
     def corners(self):
@@ -329,19 +351,19 @@ class SelectableMixin(BaseItemMixin):
         return path
 
     def get_edge_scale_bounds(self):
-        """Clickable area for the 4 edges. Biased outwards to preserve interior space."""
+        """Clickable area for all 4 edges, always centered exactly on the border line."""
         r = self.bounding_rect_unselected()
         strip = self.select_resize_size
-        m = strip / 2
-        b = self.fixed_length_for_viewport(INTERACT_INSIDE_MARGIN)
+        m = strip / 2  # half-strip overhang on each side for the endpoint caps
+        b = strip / 2  # Always center the strip on the border (half inside, half outside)
         return [
-            # Top: shifted strip - b up
-            {'rect': QtCore.QRectF(r.left() - m, r.top() - strip + b, r.width() + 2*m, strip), 'pt': self.edge_midpoints[0]},
-            # Bottom: shifted strip - b down
+            # Top edge: strip centered on top border
+            {'rect': QtCore.QRectF(r.left() - m, r.top() - b, r.width() + 2*m, strip), 'pt': self.edge_midpoints[0]},
+            # Bottom edge: strip centered on bottom border
             {'rect': QtCore.QRectF(r.left() - m, r.bottom() - b, r.width() + 2*m, strip), 'pt': self.edge_midpoints[1]},
-            # Left: shifted strip - b left
-            {'rect': QtCore.QRectF(r.left() - strip + b, r.top() - m, strip, r.height() + 2*m), 'pt': self.edge_midpoints[2]},
-            # Right: shifted strip - b right
+            # Left edge: strip centered on left border
+            {'rect': QtCore.QRectF(r.left() - b, r.top() - m, strip, r.height() + 2*m), 'pt': self.edge_midpoints[2]},
+            # Right edge: strip centered on right border
             {'rect': QtCore.QRectF(r.right() - b, r.top() - m, strip, r.height() + 2*m), 'pt': self.edge_midpoints[3]},
         ]
 
@@ -352,23 +374,14 @@ class SelectableMixin(BaseItemMixin):
         return [self.mapToScene(corner) for corner in self.corners]
 
     def get_scale_bounds(self, corner, margin=0):
-        """The interactable shape of the scale handles. Biased outwards."""
+        """The interactable shape of the scale handles, always centered on the corner point."""
         path = QtGui.QPainterPath()
         size = self.select_resize_size + 2 * margin
-        
-        # Offset to bias outwards: INTERACT_INSIDE_MARGIN px inside, the rest outside
-        bias = self.fixed_length_for_viewport(INTERACT_INSIDE_MARGIN)
-        dx = 0
-        dy = 0
-        if corner.x() < self.center.x(): dx = -size/2 + bias # Left
-        elif corner.x() > self.center.x(): dx = size/2 - bias # Right
-        
-        if corner.y() < self.center.y(): dy = -size/2 + bias # Top
-        elif corner.y() > self.center.y(): dy = size/2 - bias # Bottom
-        
+        # Center the rect on the corner point — no bias shift needed.
+        # This means equal coverage inside and outside each corner.
         path.addRect(QtCore.QRectF(
-            corner.x() + dx - size/2,
-            corner.y() + dy - size/2,
+            corner.x() - size / 2,
+            corner.y() - size / 2,
             size, size))
         return path
 
@@ -402,34 +415,46 @@ class SelectableMixin(BaseItemMixin):
         return []
 
     def boundingRect(self):
-        if not self.has_selection_outline():
+        if hasattr(self, '_in_bounding_rect'):
             return self.bounding_rect_unselected()
+        
+        self._in_bounding_rect = True
+        try:
+            if not self.has_selection_outline():
+                return self.bounding_rect_unselected()
 
-        # Add extra space for the interactive areas
-        # We need to account for both the old hover areas and the new modern rotation handle which extends upwards
-        rotate_margin = max(
-            self.select_rotate_size, 
-            self.fixed_length_for_viewport(self.SELECT_ROTATE_OFFSET + self.SELECT_ROTATE_HANDLE_SIZE)
-        )
-        margin = self.select_resize_size / 2 + rotate_margin
-        return self.bounding_rect_unselected().marginsAdded(
-            QtCore.QMarginsF(margin, margin, margin, margin))
+            # Only extend for the resize gutter. The old rotation handle
+            # margin (SELECT_ROTATE_OFFSET + SELECT_ROTATE_HANDLE_SIZE = 45px)
+            # was removed since we now use Ctrl+drag-anywhere for rotation.
+            # This prevents hover events from firing 60px from the visible border.
+            margin = self.select_resize_size / 2
+            return self.bounding_rect_unselected().marginsAdded(
+                QtCore.QMarginsF(margin, margin, margin, margin))
+        finally:
+            del self._in_bounding_rect
 
     def shape(self):
-        path = QtGui.QPainterPath()
-        if self.has_selection_handles():
-            margin = self.select_resize_size / 2
-            rect = self.bounding_rect_unselected().marginsAdded(
-                QtCore.QMarginsF(margin, margin, margin, margin))
-            path.addRect(rect)
-            for corner in self.corners:
-                path.addPath(self.get_rotate_bounds(corner))
-            path.addPath(self.get_edge_scale_path())
-            path.addPath(self.get_rotate_handle_bounds())
-        else:
-            rect = self.bounding_rect_unselected()
-            path.addRect(rect)
-        return path
+        if hasattr(self, '_in_shape'):
+            path = QtGui.QPainterPath()
+            path.addRect(self.bounding_rect_unselected())
+            return path
+            
+        self._in_shape = True
+        try:
+            path = QtGui.QPainterPath()
+            if self.has_selection_handles():
+                margin = self.select_resize_size / 2
+                rect = self.bounding_rect_unselected().marginsAdded(
+                    QtCore.QMarginsF(margin, margin, margin, margin))
+                path.addRect(rect)
+                # Note: get_edge_scale_path() is no longer needed here as the 
+                # fully expanded margin rect perfectly covers all edge interactions.
+            else:
+                rect = self.bounding_rect_unselected()
+                path.addRect(rect)
+            return path
+        finally:
+            del self._in_shape
 
     def hoverMoveEvent(self, event):
         if not self.isSelected():
@@ -437,33 +462,58 @@ class SelectableMixin(BaseItemMixin):
             return
 
         pos = event.pos()
+
+        # In a multi-selection, individual items don't show transform cursors.
+        if not self.has_selection_handles() and not isinstance(self, MultiSelectItem):
+            self.set_cursor(Qt.CursorShape.ArrowCursor)
+            return
         
-        # Priority 1: Modern Rotation Handle
-        if self.get_rotate_handle_bounds().contains(pos):
+        # PureRef style: Show rotation cursor if Ctrl is held
+        if event.modifiers() == Qt.KeyboardModifier.ControlModifier:
             self.set_cursor(Qt.CursorShape.PointingHandCursor)
             return
 
-        # Priority 2: The 8 circular handles - generous 40px hit zones
-        closest_pt = None
-        min_dist = float('inf')
-        for pt in self.all_point_handles:
-            if self.get_scale_bounds(pt, margin=self.select_resize_size/2).contains(pos):
-                dist = math.hypot(pos.x() - pt.x(), pos.y() - pt.y())
-                if dist < min_dist:
-                    min_dist = dist
-                    closest_pt = pt
-        
-        if closest_pt:
-            self.set_cursor(self.get_corner_scale_cursor(closest_pt))
+        # --- DIRECT DISTANCE-FROM-BORDER APPROACH ---
+        # Instead of complex path intersection, just check distance from each edge.
+        # This is mathematically guaranteed to work for any resize size value.
+        r = self.bounding_rect_unselected()
+        half = self.select_resize_size / 2
+
+        near_left   = abs(pos.x() - r.left())   <= half
+        near_right  = abs(pos.x() - r.right())  <= half
+        near_top    = abs(pos.y() - r.top())     <= half
+        near_bottom = abs(pos.y() - r.bottom())  <= half
+
+        within_x = r.left() - half <= pos.x() <= r.right() + half
+        within_y = r.top() - half  <= pos.y() <= r.bottom() + half
+
+        if not (near_left or near_right or near_top or near_bottom):
+            # Not near any border → inside the item → Arrow
+            self.set_cursor(Qt.CursorShape.ArrowCursor)
             return
 
-        # Priority 3: Continuous Border Scaling (edges and corners)
-        if self.get_edge_scale_path().contains(pos):
-            edge_pt = self.get_closest_transform_point(pos)
-            self.set_cursor(self.get_corner_scale_cursor(edge_pt))
+        # Find the closest reference point to get the correct directional cursor
+        if near_top and near_left:
+            ref_pt = r.topLeft()
+        elif near_top and near_right:
+            ref_pt = r.topRight()
+        elif near_bottom and near_left:
+            ref_pt = r.bottomLeft()
+        elif near_bottom and near_right:
+            ref_pt = r.bottomRight()
+        elif near_top and within_x:
+            ref_pt = QtCore.QPointF(r.center().x(), r.top())
+        elif near_bottom and within_x:
+            ref_pt = QtCore.QPointF(r.center().x(), r.bottom())
+        elif near_left and within_y:
+            ref_pt = QtCore.QPointF(r.left(), r.center().y())
+        elif near_right and within_y:
+            ref_pt = QtCore.QPointF(r.right(), r.center().y())
+        else:
+            self.set_cursor(Qt.CursorShape.ArrowCursor)
             return
 
-        self.unset_cursor()
+        self.set_cursor(self.get_corner_scale_cursor(ref_pt))
 
     def hoverLeaveEvent(self, event):
         self.unset_cursor()
@@ -473,20 +523,29 @@ class SelectableMixin(BaseItemMixin):
         self.scene().views()[0].reset_previous_transform(toggle_item=self)
         if not self.isSelected():
             # User has just selected this item with this click; don't
-            # activate any transformations yet
+            # activate any transformations yet.
             super().mousePressEvent(event)
             return
 
-        if not self.is_in_transform_zone(event.pos()):
-            super().mousePressEvent(event)
-            return
+        # STABILITY: If we are clicking a selected item but NOT in a transform
+        # zone, force Arrow cursor to prevent the brief "Hand" icon flicker.
+        in_zone = self.is_in_transform_zone(event.pos())
+        if not in_zone:
+            # PureRef style: holding Ctrl allows rotation ANYWHERE on the item
+            if (event.button() == Qt.MouseButton.LeftButton 
+                and event.modifiers() == Qt.KeyboardModifier.ControlModifier):
+                pass # Allow process to continue to mode selection below
+            else:
+                self.set_cursor(Qt.CursorShape.ArrowCursor)
+                super().mousePressEvent(event)
+                return
 
         if (event.button() == Qt.MouseButton.LeftButton
                 and self.has_selection_handles()):
             pos = event.pos()
             
-            # Priority 1: Modern Rotation Handle
-            if self.get_rotate_handle_bounds().contains(pos):
+            # PureRef style: Ctrl+Drag ANYWHERE on/near the selection triggers rotation
+            if event.modifiers() == Qt.KeyboardModifier.ControlModifier:
                 self.active_mode = self.ROTATE_MODE
                 self.event_anchor = self.center_scene_coords
                 self.rotate_start_angle = self.get_rotate_angle(event.scenePos())
@@ -495,7 +554,7 @@ class SelectableMixin(BaseItemMixin):
                 event.accept()
                 return
 
-            # Priority 2: The 8 circular handles - generous 40px hit zones
+            # Priority 1: The 8 circular handles - generous 40px hit zones
             closest_pt = None
             min_dist = float('inf')
             for pt in self.all_point_handles:
@@ -514,25 +573,15 @@ class SelectableMixin(BaseItemMixin):
                 event.accept()
                 return
 
-            # Priority 3: Continuous Border Scaling (edges and corners)
-            if self.get_edge_scale_path().contains(pos):
+            # Priority 2: Continuous Border Scaling (edges and corners)
+            edge_hit = self.get_edge_scale_path().contains(pos)
+            if edge_hit:
                 edge_pt = self.get_closest_transform_point(pos)
                 self.active_mode = self.SCALE_MODE
                 self.event_direction = self.get_direction_from_center(event.scenePos())
                 self.event_anchor = self.mapToScene(self.get_scale_anchor(edge_pt))
                 for item in self.selection_action_items():
                     item.scale_orig_factor = item.scale()
-                event.accept()
-                return
-
-            # PureRef style: Ctrl+Drag anywhere in transform zone triggers rotation
-            if event.modifiers() == Qt.KeyboardModifier.ControlModifier:
-                self.active_mode = self.ROTATE_MODE
-                self.event_anchor = self.center_scene_coords
-                self.rotate_start_angle = self.get_rotate_angle(
-                    event.scenePos())
-                for item in self.selection_action_items():
-                    item.rotate_orig_degrees = item.rotation()
                 event.accept()
                 return
 
@@ -656,9 +705,35 @@ class SelectableMixin(BaseItemMixin):
 
         if self.active_mode == self.SCALE_MODE:
             factor = self.get_scale_factor(event)
-            for item in self.selection_action_items():
-                item.setScale(item.scale_orig_factor * factor,
-                              item.mapFromScene(self.event_anchor))
+            scene = self.scene()
+            if scene:
+                scene._updating_scene = True
+            try:
+                for item in self.selection_action_items():
+                    item.setScale(item.scale_orig_factor * factor,
+                                  item.mapFromScene(self.event_anchor))
+            finally:
+                if scene:
+                    scene._updating_scene = False
+                    if scene.has_multi_selection() and scene.multi_select_item.scene():
+                        scene.multi_select_item.fit_selection_area(scene.itemsBoundingRect(selection_only=True))
+            # Live collab: broadcast scale during drag (throttled ~30fps)
+            scene = self.scene()
+            if scene:
+                mgr = scene._get_collab_manager() if hasattr(scene, '_get_collab_manager') else None
+                if mgr and mgr.is_active and not mgr.applying_remote:
+                    import time as _t
+                    now = _t.monotonic() * 1000
+                    if not hasattr(self, '_last_scale_bc'):
+                        self._last_scale_bc = 0
+                    if now - self._last_scale_bc >= 33:
+                        self._last_scale_bc = now
+                        for item in self.selection_action_items():
+                            if hasattr(item, 'ensure_collab_id'):
+                                mgr.broadcast_item_transformed(
+                                    [item.ensure_collab_id()], 'scale',
+                                    scale=item.scale(),
+                                    x=item.pos().x(), y=item.pos().y())
             # Explicit update to avoid ghosting artifacts
             if self.scene():
                 self.scene().update()
@@ -668,10 +743,36 @@ class SelectableMixin(BaseItemMixin):
             snap = (event.modifiers() == Qt.KeyboardModifier.ControlModifier
                     or event.modifiers() == Qt.KeyboardModifier.ShiftModifier)
             delta = self.get_rotate_delta(event.scenePos(), snap)
-            for item in self.selection_action_items():
-                item.setRotation(
-                    item.rotate_orig_degrees + delta * item.flip(),
-                    item.mapFromScene(self.event_anchor))
+            scene = self.scene()
+            if scene:
+                scene._updating_scene = True
+            try:
+                for item in self.selection_action_items():
+                    item.setRotation(
+                        item.rotate_orig_degrees + delta * item.flip(),
+                        item.mapFromScene(self.event_anchor))
+            finally:
+                if scene:
+                    scene._updating_scene = False
+                    if scene.has_multi_selection() and scene.multi_select_item.scene():
+                        scene.multi_select_item.fit_selection_area(scene.itemsBoundingRect(selection_only=True))
+            # Live collab: broadcast rotation during drag (throttled ~30fps)
+            scene = self.scene()
+            if scene:
+                mgr = scene._get_collab_manager() if hasattr(scene, '_get_collab_manager') else None
+                if mgr and mgr.is_active and not mgr.applying_remote:
+                    import time as _t
+                    now = _t.monotonic() * 1000
+                    if not hasattr(self, '_last_rotate_bc'):
+                        self._last_rotate_bc = 0
+                    if now - self._last_rotate_bc >= 33:
+                        self._last_rotate_bc = now
+                        for item in self.selection_action_items():
+                            if hasattr(item, 'ensure_collab_id'):
+                                mgr.broadcast_item_transformed(
+                                    [item.ensure_collab_id()], 'rotate',
+                                    rotation=item.rotation(),
+                                    x=item.pos().x(), y=item.pos().y())
             # Explicit update to avoid ghosting artifacts
             if self.scene():
                 self.scene().update()
@@ -689,6 +790,17 @@ class SelectableMixin(BaseItemMixin):
                         self.get_scale_factor(event),
                         self.event_anchor,
                         ignore_first_redo=True))
+                # Broadcast final scale (ignore_first_redo skips _broadcast in redo)
+                scene = self.scene()
+                if scene:
+                    mgr = scene._get_collab_manager() if hasattr(scene, '_get_collab_manager') else None
+                    if mgr and mgr.is_active and not mgr.applying_remote:
+                        for item in self.selection_action_items():
+                            if hasattr(item, 'ensure_collab_id'):
+                                mgr.broadcast_item_transformed(
+                                    [item.ensure_collab_id()], 'scale',
+                                    scale=item.scale(),
+                                    x=item.pos().x(), y=item.pos().y())
             event.accept()
             self.active_mode = None
             return
@@ -703,6 +815,17 @@ class SelectableMixin(BaseItemMixin):
                         self.get_rotate_delta(event.scenePos(), snap),
                         self.event_anchor,
                         ignore_first_redo=True))
+                # Broadcast final rotation (ignore_first_redo skips _broadcast in redo)
+                scene = self.scene()
+                if scene:
+                    mgr = scene._get_collab_manager() if hasattr(scene, '_get_collab_manager') else None
+                    if mgr and mgr.is_active and not mgr.applying_remote:
+                        for item in self.selection_action_items():
+                            if hasattr(item, 'ensure_collab_id'):
+                                mgr.broadcast_item_transformed(
+                                    [item.ensure_collab_id()], 'rotate',
+                                    rotation=item.rotation(),
+                                    x=item.pos().x(), y=item.pos().y())
             event.accept()
             self.active_mode = None
             return
@@ -727,7 +850,10 @@ class MultiSelectItem(SelectableMixin,
     def __init__(self):
         super().__init__()
         logger.debug(f'Initialized {self}')
+        self._fitting = False
         self.init_selectable()
+        self.setBrush(QtGui.QBrush(Qt.GlobalColor.transparent))
+        self.setPen(QtGui.QPen(Qt.PenStyle.NoPen))  # Border is drawn by paint_selectable
 
     def __str__(self):
         return (f'MultiSelectItem {self.width} x {self.height}')
@@ -762,7 +888,7 @@ class MultiSelectItem(SelectableMixin,
         """The items affected by selection actions like scaling and rotating.
         """
         if self.scene():
-            return list(self.scene().selectedItems())
+            return list(self.scene().selectedItems(user_only=True))
         return []
 
     def lower_behind_selection(self):
@@ -773,33 +899,47 @@ class MultiSelectItem(SelectableMixin,
 
     def fit_selection_area(self, rect):
         """Updates itself to fit the given selection area."""
+        if self._fitting:
+            return
+        self._fitting = True
+        try:
+            logger.trace(f'Fit selection area to {rect}')
 
-        logger.trace(f'Fit selection area to {rect}')
-
-        # Only update when values have changed, otherwise we end up in an
-        # infinite event loop sceneChange -> itemChange -> sceneChange ...
-        if self.width != rect.width() or self.height != rect.height():
-            self.setRect(0, 0, rect.width(), rect.height())
-        if self.pos() != rect.topLeft():
-            self.setPos(rect.topLeft())
-        if self.scale() != 1:
-            self.setScale(1)
-        if self.rotation() != 0:
-            self.setRotation(0)
-        if not self.isSelected():
-            self.setSelected(True)
-        if self.flip() == -1:
-            self.setTransform(QtGui.QTransform.fromScale(1, 1))
+            # Only update when values have changed, otherwise we end up in an
+            # infinite event loop sceneChange -> itemChange -> sceneChange ...
+            if self.width != rect.width() or self.height != rect.height():
+                self.setRect(0, 0, rect.width(), rect.height())
+            if self.pos() != rect.topLeft():
+                self.setPos(rect.topLeft())
+            if self.scale() != 1:
+                self.setScale(1)
+            if self.rotation() != 0:
+                self.setRotation(0)
+            if not self.isSelected():
+                self.setSelected(True)
+            if self.flip() == -1:
+                self.setTransform(QtGui.QTransform.fromScale(1, 1))
+        finally:
+            self._fitting = False
 
     def mousePressEvent(self, event):
-        if (event.button() == Qt.MouseButton.LeftButton
-                and event.modifiers() == Qt.KeyboardModifier.ControlModifier):
-            # We still need to be able to select additional images
-            # within/"under" the multi select rectangle, so let ctrl+click
-            # events pass through
-            event.ignore()
+        in_zone = self.is_in_transform_zone(event.pos())
+        # BORDER ZONE: If the user clicks on the transform border, handle it immediately.
+        if in_zone:
+            super().mousePressEvent(event)
             return
 
+        # CTRL+CLICK on interior: normally rotate. But if user Ctrl+clicks on a
+        # specific selected item, pass through to deselect that individual item.
+        if (event.button() == Qt.MouseButton.LeftButton
+                and event.modifiers() == Qt.KeyboardModifier.ControlModifier):
+            item = self.scene().itemAt(event.scenePos(), QtGui.QTransform())
+            if item and item != self and item.isSelected():
+                event.ignore()
+                return
+
+        # INTERIOR CLICK / DRAG: call super() so Qt moves all selected items together.
+        # This preserves the expected "click and drag inside group to move all" behavior.
         super().mousePressEvent(event)
 
 
@@ -815,6 +955,10 @@ class RubberbandItem(BaseItemMixin, QtWidgets.QGraphicsRectItem):
         pen.setWidth(1)
         pen.setCosmetic(True)
         self.setPen(pen)
+
+    def bounding_rect_unselected(self):
+        """Returns the base rectangle of the rubberband."""
+        return self.rect()
 
     def __str__(self):
         return (f'RubberbandItem {self.width} x {self.height}')

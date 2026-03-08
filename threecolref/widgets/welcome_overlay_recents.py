@@ -21,7 +21,7 @@ class RecentFileCard(QtWidgets.QFrame):
         self.filename = filename
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedSize(160, 180) # Vertical card
+        self.setFixedSize(140, 160) # Slightly smaller card
 
         # Style: Glassmorphism effect, subtle border
         self.setObjectName("RecentFileCard")
@@ -43,7 +43,7 @@ class RecentFileCard(QtWidgets.QFrame):
 
         # Thumbnail Container
         self.thumb = QtWidgets.QLabel()
-        self.thumb.setFixedSize(140, 95)
+        self.thumb.setFixedSize(120, 80)
         self.thumb.setStyleSheet("""
             background-color: rgba(0, 0, 0, 80);
             border-radius: 4px;
@@ -103,7 +103,7 @@ class RecentFileCard(QtWidgets.QFrame):
         self.remove_btn.clicked.connect(self._on_remove_clicked)
         
         # Position it top right
-        self.remove_btn.move(135, 3)
+        self.remove_btn.move(115, 3)
 
     def _get_preview_pixmap(self, filename):
         """Try to load a real preview, fallback to a smart placeholder."""
@@ -171,26 +171,27 @@ class RecentFilesContainer(QtWidgets.QFrame):
         self.settings = BeeSettings()
         
         self.setObjectName("RecentFilesContainer")
-        self.setFixedHeight(300) # Fixed height for the history box
+        self.setFixedHeight(240) 
         self.setStyleSheet("""
             #RecentFilesContainer {
-                background-color: rgba(25, 25, 25, 220);
-                border: 1px solid rgba(255, 255, 255, 8);
+                background-color: rgba(20, 20, 20, 240);
+                border-top: 1px solid rgba(255, 255, 255, 10);
                 border-radius: 12px;
+                margin: 0px;
             }
         """)
         
         main_layout = QtWidgets.QVBoxLayout(self)
-        main_layout.setContentsMargins(25, 20, 25, 20)
+        main_layout.setContentsMargins(60, 40, 60, 20)
         main_layout.setSpacing(15)
 
         # Header
         header = QtWidgets.QLabel("Recent")
         header.setStyleSheet("""
-            font-size: 14px; 
+            font-size: 15px; 
             font-weight: 600; 
-            color: rgba(255, 255, 255, 180);
-            letter-spacing: 0.5px;
+            color: rgba(255, 255, 255, 220);
+            letter-spacing: 0.6px;
         """)
         main_layout.addWidget(header)
 

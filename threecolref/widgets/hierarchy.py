@@ -249,20 +249,45 @@ class HierarchyOverlay(QtWidgets.QWidget):
 
         self.list_widget.clear()
 
-        user_items = sorted(
-            [i for i in self.scene.items() if self._is_user_item(i)],
-            key=lambda i: -i.zValue())
-
-        for item in user_items:
+        # 1. Fetch all items and identify top-level items
+        all_user_items = [i for i in self.scene.items() if self._is_user_item(i)]
+        item_to_children = {}
+        top_level = []
+        for item in all_user_items:
+            p = item.parentItem()
+            if p and p in all_user_items:
+                item_to_children.setdefault(p, []).append(item)
+            else:
+                top_level.append(item)
+        
+        # 2. Sort top-level by Z-order (descending)
+        top_level.sort(key=lambda i: -i.zValue())
+        
+        # 3. Recursive helper to add items to list with indentation
+        def add_recursive(item, depth=0):
             label = self._get_label(item)
-            icon  = self._get_thumbnail(item)
+            if depth > 0:
+                # Add indentation and nesting icon
+                label = "    " * depth + "↳ " + label
+            
+            icon = self._get_thumbnail(item)
             list_item = QtWidgets.QListWidgetItem(icon, label)
             list_item.setData(Qt.ItemDataRole.UserRole, id(item))
-
+            
             if id(item) in selected_ids or item.isSelected():
                 list_item.setSelected(True)
-
+            
             self.list_widget.addItem(list_item)
+            
+            # Add children sorted by Z (usually want them stay on top in list too)
+            children = item_to_children.get(item, [])
+            children.sort(key=lambda i: -i.zValue())
+            for child in children:
+                add_recursive(child, depth + 1)
+
+        # 4. Fill the list
+        for item in top_level:
+            add_recursive(item)
 
         self.list_widget.blockSignals(False)
         self._sync_selection_from_scene() # Ensure detail panel updates

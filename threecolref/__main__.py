@@ -107,7 +107,7 @@ class threecolrefMainWindow(QtWidgets.QMainWindow):
         from threecolref.view import BeeMainWidget
         self.main_widget = BeeMainWidget(app, self)
         self.view = self.main_widget.view # Keep self.view reference for existing logic
-        self._margin = 4  # Standard Windows resize border width (was 18, which caused overlap issues)
+        self._margin = 6  # Resize border width — generous enough to grab, small enough to not overlap
         
         default_window_size = QtCore.QSize(500, 300)
         geom = self.view.settings.value('MainWindow/geometry')
@@ -334,30 +334,19 @@ class _FramelessResizeEventFilter(QtCore.QObject):
                 if hasattr(event, 'globalPosition'):
                     global_pos = event.globalPosition().toPoint()
                 else:
-                    # Fallback for older Qt versions
                     global_pos = event.globalPos()
                 
                 win_pos = self._w.mapFromGlobal(global_pos)
                 
-                # Check if mouse is near any edge (with generous margin)
+                # Check if mouse is near any edge
                 w = self._w.width()
                 h = self._w.height()
                 m = self._w._margin
                 
-                # Always check edges, even slightly outside bounds for better UX
-                edges = QtCore.Qt.Edge(0)
-                if win_pos.x() <= m:
-                    edges |= QtCore.Qt.Edge.LeftEdge
-                if win_pos.x() >= w - m:
-                    edges |= QtCore.Qt.Edge.RightEdge
-                if win_pos.y() <= m:
-                    edges |= QtCore.Qt.Edge.TopEdge
-                if win_pos.y() >= h - m:
-                    edges |= QtCore.Qt.Edge.BottomEdge
-                
+                edges = self._w._resize_edges_at_pos(win_pos)
                 cursor = self._cursor_for_edges(edges)
+                
                 if cursor is not None:
-                    # Use override cursor so it takes priority over child widget cursors
                     if not self._resize_cursor_active:
                         QtWidgets.QApplication.setOverrideCursor(QtGui.QCursor(cursor))
                         self._resize_cursor_active = True
@@ -367,10 +356,18 @@ class _FramelessResizeEventFilter(QtCore.QObject):
                     if self._resize_cursor_active:
                         QtWidgets.QApplication.restoreOverrideCursor()
                         self._resize_cursor_active = False
+                    
+                    # SAFETY POKE: If we are well inside the window but NOT in the margin,
+                    # force-reset the window cursor to Arrow once to break any native sticky state.
+                    if win_pos.x() > m * 3 and win_pos.x() < w - m * 3 and \
+                       win_pos.y() > m * 3 and win_pos.y() < h - m * 3:
+                        if self._w.cursor().shape() != QtCore.Qt.CursorShape.ArrowCursor:
+                            self._w.setCursor(QtCore.Qt.CursorShape.ArrowCursor)
+                            QtCore.QTimer.singleShot(0, self._w.unsetCursor)
                 
                 return False
 
-            if et == QtCore.QEvent.Type.Leave:
+            if et in (QtCore.QEvent.Type.Leave, QtCore.QEvent.Type.WindowDeactivate, QtCore.QEvent.Type.FocusOut):
                 if self._resize_cursor_active:
                     QtWidgets.QApplication.restoreOverrideCursor()
                     self._resize_cursor_active = False
@@ -380,11 +377,9 @@ class _FramelessResizeEventFilter(QtCore.QObject):
                 if event.button() != Qt.MouseButton.LeftButton:
                     return False
                 
-                # Don't allow resize when maximized
                 if self._w.isMaximized():
                     return False
 
-                # Use global position for resize detection
                 if hasattr(event, 'globalPosition'):
                     global_pos = event.globalPosition().toPoint()
                 else:
@@ -401,11 +396,17 @@ class _FramelessResizeEventFilter(QtCore.QObject):
                     event.accept()
                     return True
 
+            if et == QtCore.QEvent.Type.MouseButtonRelease:
+                if self._resize_cursor_active:
+                    QtWidgets.QApplication.restoreOverrideCursor()
+                    self._resize_cursor_active = False
+                return False
+
         except Exception:
-            # Never crash - just fail silently
             if self._resize_cursor_active:
                 try:
-                    QtWidgets.QApplication.restoreOverrideCursor()
+                    while QtWidgets.QApplication.overrideCursor() is not None:
+                        QtWidgets.QApplication.restoreOverrideCursor()
                 except Exception:
                     pass
                 self._resize_cursor_active = False

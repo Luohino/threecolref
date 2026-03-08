@@ -21,23 +21,25 @@ from threecolref.config import KeyboardSettings
 from threecolref.widgets.controls.keyboard import KeyboardShortcutsView
 from threecolref.widgets.controls.mouse import MouseView
 from threecolref.widgets.controls.mousewheel import MouseWheelView
-
+from threecolref.widgets import ios_dialogs
 
 logger = logging.getLogger(__name__)
 
 
-class ControlsDialog(QtWidgets.QDialog):
+class ControlsDialog(ios_dialogs._IosDialogBase):
     def __init__(self, parent):
-        super().__init__(parent)
-        self.setWindowTitle('Keyboard & Mouse Controls')
-        tabs = QtWidgets.QTabWidget()
+        super().__init__(parent, 'Keyboard & Mouse Controls')
+        self.setMinimumSize(700, 500)
+        tabs = QtWidgets.QTabWidget(self.container)
+        tabs.setStyleSheet("color: white; background-color: transparent;")
 
         # Keyboard shortcuts
-        keyboard = QtWidgets.QWidget(parent)
+        keyboard = QtWidgets.QWidget(self.container)
         kb_layout = QtWidgets.QVBoxLayout()
         keyboard.setLayout(kb_layout)
         table = KeyboardShortcutsView(keyboard)
-        search_input = QtWidgets.QLineEdit()
+        search_input = QtWidgets.QLineEdit(self.container)
+        search_input.setStyleSheet("background-color: rgba(255, 255, 255, 0.1); color: white; border-radius: 4px; padding: 4px;")
         search_input.setPlaceholderText('Search...')
         search_input.textChanged.connect(table.model().setFilterFixedString)
         kb_layout.addWidget(search_input)
@@ -45,11 +47,12 @@ class ControlsDialog(QtWidgets.QDialog):
         tabs.addTab(keyboard, '&Keyboard Shortcuts')
 
         # Mouse controls
-        mouse = QtWidgets.QWidget(parent)
+        mouse = QtWidgets.QWidget(self.container)
         mouse_layout = QtWidgets.QVBoxLayout()
         mouse.setLayout(mouse_layout)
         table = MouseView(mouse)
-        search_input = QtWidgets.QLineEdit()
+        search_input = QtWidgets.QLineEdit(self.container)
+        search_input.setStyleSheet("background-color: rgba(255, 255, 255, 0.1); color: white; border-radius: 4px; padding: 4px;")
         search_input.setPlaceholderText('Search...')
         search_input.textChanged.connect(table.model().setFilterFixedString)
         mouse_layout.addWidget(search_input)
@@ -57,40 +60,45 @@ class ControlsDialog(QtWidgets.QDialog):
         tabs.addTab(mouse, '&Mouse')
 
         # Mouse wheel controls
-        mousewheel = QtWidgets.QWidget(parent)
+        mousewheel = QtWidgets.QWidget(self.container)
         wheel_layout = QtWidgets.QVBoxLayout()
         mousewheel.setLayout(wheel_layout)
         table = MouseWheelView(mousewheel)
-        search_input = QtWidgets.QLineEdit()
+        search_input = QtWidgets.QLineEdit(self.container)
+        search_input.setStyleSheet("background-color: rgba(255, 255, 255, 0.1); color: white; border-radius: 4px; padding: 4px;")
         search_input.setPlaceholderText('Search...')
         search_input.textChanged.connect(table.model().setFilterFixedString)
         wheel_layout.addWidget(search_input)
         wheel_layout.addWidget(table)
         tabs.addTab(mousewheel, 'Mouse &Wheel')
 
-        layout = QtWidgets.QVBoxLayout()
-        self.setLayout(layout)
-        layout.addWidget(tabs)
+        self.content_layout.addWidget(tabs)
+        self.content_layout.addSpacing(10)
 
         # Bottom row of buttons
-        buttons = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.StandardButton.Close)
-        buttons.rejected.connect(self.reject)
-        reset_btn = QtWidgets.QPushButton('&Restore Defaults')
-        reset_btn.setAutoDefault(False)
-        reset_btn.clicked.connect(self.on_restore_defaults)
-        buttons.addButton(reset_btn,
-                          QtWidgets.QDialogButtonBox.ButtonRole.ActionRole)
+        self.close_btn = self._create_button("Close")
+        self.close_btn.clicked.connect(self.reject)
+        
+        sep = QtWidgets.QFrame()
+        sep.setFixedWidth(1)
+        sep.setStyleSheet("background-color: rgba(255, 255, 255, 0.1); border: none;")
+        
+        self.restore_btn = self._create_button("Restore Defaults", is_destructive=True)
+        self.restore_btn.clicked.connect(self.on_restore_defaults)
 
-        layout.addWidget(buttons)
+        self.button_layout.addWidget(self.close_btn)
+        self.button_layout.addWidget(sep)
+        self.button_layout.addWidget(self.restore_btn)
+
         self.show()
 
     def on_restore_defaults(self, *args, **kwargs):
-        reply = QtWidgets.QMessageBox.question(
+        from threecolref.widgets.ios_dialogs import BeeIosMessageDialog
+        reply = BeeIosMessageDialog.show_message(
             self,
             'Restore defaults?',
             'Do you want to restore all keyboard and mouse settings '
             'to their default values?')
 
-        if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+        if reply == "OK":
             KeyboardSettings().restore_defaults()

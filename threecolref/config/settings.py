@@ -148,6 +148,24 @@ class BeeSettings(QtCore.QSettings):
             'cast': int,
             'validate': lambda x: x >= 0,
             'post_save_callback': QtGui.QImageReader.setAllocationLimit,
+        },
+        'Items/doodle_color': {
+            'default': '#FF0000',
+            'validate': lambda x: isinstance(x, str) and x.startswith('#'),
+        },
+        'Items/doodle_width': {
+            'default': 2,
+            'cast': int,
+            'validate': lambda x: 1 <= x <= 100,
+        },
+        'Items/doodle_opacity': {
+            'default': 1.0,
+            'cast': float,
+            'validate': lambda x: 0.0 <= x <= 1.0,
+        },
+        'Collaboration/username': {
+            'default': '',
+            'validate': lambda x: isinstance(x, str) and len(x) <= 32,
         }
     }
 
@@ -239,13 +257,20 @@ class BeeSettings(QtCore.QSettings):
             values.remove(filename)
         values.insert(0, filename)
 
+        # Clear the whole group to ensure no stale entries remain
+        self.beginGroup('RecentFiles')
+        self.remove('')
+        self.endGroup()
+
         self.beginWriteArray('RecentFiles')
         for i, filename in enumerate(values[:10]):
             self.setArrayIndex(i)
             self.setValue('path', filename)
         self.endArray()
+        self.sync()
 
     def get_recent_files(self, existing_only=False):
+        self.sync() # Reload from disk to ensure we see updates from other instances
         values = []
         size = self.beginReadArray('RecentFiles')
         for i in range(size):
@@ -273,5 +298,6 @@ class BeeSettings(QtCore.QSettings):
                 self.setArrayIndex(i)
                 self.setValue('path', fname)
             self.endArray()
+            self.sync()
             return True
         return False

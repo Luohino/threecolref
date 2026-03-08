@@ -31,6 +31,7 @@ menu_structure = [
             'toggle_autosave',
             MENU_SEPARATOR,
             'export_scene',
+            'copy_scene_image',
             'export_images',
             'export_item',
             MENU_SEPARATOR,
@@ -125,6 +126,15 @@ menu_structure = [
             'settings',
             'keyboard_settings',
             'open_settings_dir',
+        ],
+    },
+    {
+        'menu': '&Collaborate',
+        'items': [
+            'share_session',
+            'join_session',
+            MENU_SEPARATOR,
+            'stop_collaboration',
         ],
     },
     {

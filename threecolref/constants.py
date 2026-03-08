@@ -13,16 +13,36 @@
 # You should have received a copy of the GNU General Public License
 # along with threecolref.  If not, see <https://www.gnu.org/licenses/>.
 
+import os
+
+# --- .env LOADER ---
+# This allows us to hide sensitive URLs from the public GitHub repo
+_env_path = os.path.join(os.path.dirname(__file__), '..', '.env')
+if os.path.exists(_env_path):
+    with open(_env_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                key, value = line.split('=', 1)
+                os.environ[key.strip()] = value.strip()
+
 APPNAME = '3ColRef'
 APPNAME_FULL = f'{APPNAME} Reference Image Viewer'
 VERSION = '1.0.0'
-WEBSITE = 'https://github.com/Luohino/threecolref'
+WEBSITE = 'https://3colref.vercel.app'
 COPYRIGHT = 'Copyright © 2024-2026 Luohino'
 
 EXTENSION = '.3col'
 FILE_TYPE_NAME = f'{APPNAME} Scene'
 
-CHANGED_SYMBOL = '✎'
+CHANGELOG_URL = f'{WEBSITE}/changelog'
+
+# Security: COLLAB_SERVER_URL is loaded from .env if it exists.
+# For local convenience, the default is set to your Render URL.
+# WARNING: DO NOT COMMIT THIS FILE IF THE URL BELOW IS PRIVATE!
+COLLAB_SERVER_URL = os.environ.get('COLLAB_SERVER_URL', 'https://.com')
+
+CHANGED_SYMBOL = '•'
 
 COLORS = {
     # Qt:
@@ -44,7 +64,7 @@ COLORS = {
     'Disabled:Text': (140, 140, 140),
 
     # threecolref specific:
-    'Scene:Selection': (0, 212, 255),  # Bright cyan - matches reference
+    'Scene:Selection': (66, 116, 159),  # Muted Slate Blue (PureRef-style)
     'Scene:Canvas': (60, 60, 60),
     'Scene:Text': (200, 200, 200),
 }

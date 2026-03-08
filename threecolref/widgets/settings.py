@@ -22,6 +22,7 @@ from PyQt6.QtCore import Qt
 from threecolref import constants
 from threecolref.config import BeeSettings, settings_events
 from threecolref.assets import BeeAssets
+from threecolref.widgets import ios_dialogs
 
 
 logger = logging.getLogger(__name__)
@@ -157,6 +158,35 @@ class SingleCheckboxGroup(GroupBase):
         return value == Qt.CheckState.Checked
 
 
+class TextGroup(GroupBase):
+    def __init__(self):
+        super().__init__()
+        self.input = QtWidgets.QLineEdit()
+        self.input.setStyleSheet("""
+            QLineEdit {
+                background-color: rgba(255, 255, 255, 0.05);
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                border-radius: 6px;
+                padding: 8px 12px;
+                color: white;
+                font-size: 13px;
+                selection-background-color: #0A84FF;
+            }
+            QLineEdit:focus {
+                border: 1px solid #0A84FF;
+                background-color: rgba(255, 255, 255, 0.08);
+            }
+        """)
+        self.set_value(self.settings.valueOrDefault(self.KEY))
+        self.input.textChanged.connect(self.on_value_changed)
+        self.layout.addWidget(self.input)
+        self.layout.addStretch(100)
+        self.ignore_value_changed = False
+
+    def set_value(self, value):
+        self.input.setText(str(value))
+
+
 class ArrangeDefaultWidget(RadioGroup):
     TITLE = 'Default Arrange Method:'
     HELPTEXT = ('How images are arranged when inserted in batch')
@@ -208,6 +238,13 @@ class ConfirmCloseUnsavedWidget(SingleCheckboxGroup):
         'confirmation?')
     LABEL = 'Confirm when closing'
     KEY = 'Save/confirm_close_unsaved'
+
+
+class CollaborationUsernameWidget(TextGroup):
+    TITLE = 'Collaboration Username:'
+    HELPTEXT = ('The name others will see when you join a collaboration session.'
+                ' If left empty, a random name will be used.')
+    KEY = 'Collaboration/username'
 
 
 class SettingsCategory:
@@ -276,10 +313,9 @@ class SettingsListButton(QtWidgets.QPushButton):
         """)
 
 
-class SettingsDialog(QtWidgets.QDialog):
+class SettingsDialog(ios_dialogs._IosDialogBase):
     def __init__(self, parent):
-        super().__init__(parent)
-        self.setWindowTitle('Settings')
+        super().__init__(parent, 'Settings')
         self.setMinimumSize(800, 600)
         self.selected_category = None
         self.category_buttons = {}
@@ -288,7 +324,7 @@ class SettingsDialog(QtWidgets.QDialog):
         main_layout = QtWidgets.QHBoxLayout()
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
-        self.setLayout(main_layout)
+        self.content_layout.addLayout(main_layout)
         
         # --- LEFT SIDEBAR ---
         sidebar = QtWidgets.QWidget()
@@ -308,10 +344,10 @@ class SettingsDialog(QtWidgets.QDialog):
                 background-color: #333;
                 border: 1px solid #444;
                 border-radius: 18px;
-                padding: 0px 16px;
+                padding: 0px 15px;
                 color: #ffffff;
                 font-size: 13px;
-                margin: 16px 16px 12px 16px;
+                margin: 0px 16px;
                 selection-background-color: #444;
             }
             QLineEdit:focus {
@@ -320,8 +356,10 @@ class SettingsDialog(QtWidgets.QDialog):
             }
         """)
         search_box.setFixedHeight(36)
-        sidebar_layout.addWidget(search_box)
         
+        sidebar_layout.addSpacing(16)
+        sidebar_layout.addWidget(search_box)
+        sidebar_layout.addSpacing(8)
         # Define categories
         assets = BeeAssets()
         categories = [
@@ -330,6 +368,7 @@ class SettingsDialog(QtWidgets.QDialog):
             SettingsCategory('Saving and loading', assets.icon_save, []),
             SettingsCategory('Window', assets.icon_window, []),
             SettingsCategory('Images', assets.icon_image, []),
+            SettingsCategory('Collaboration', assets.icon_perf, []), # Reusing icon for now
             SettingsCategory('Keyboard shortcuts', assets.icon_keyboard, []),
         ]
         
@@ -341,54 +380,8 @@ class SettingsDialog(QtWidgets.QDialog):
             self.category_buttons[i] = btn
             sidebar_layout.addWidget(btn)
         
-        sidebar_layout.addStretch()
         
-        # Bottom buttons in sidebar
-        bottom_buttons = QtWidgets.QWidget()
-        bottom_layout = QtWidgets.QHBoxLayout()
-        bottom_layout.setContentsMargins(8, 8, 8, 8)
-        bottom_layout.setSpacing(8)
-        
-        # Restore defaults button
-        restore_btn = QtWidgets.QPushButton()
-        restore_btn.setIcon(QtGui.QIcon(assets.icon_restore))
-        restore_btn.setIconSize(QtCore.QSize(18, 18))
-        restore_btn.setToolTip('Restore defaults')
-        restore_btn.setFlat(True)
-        restore_btn.setFixedSize(32, 32)
-        restore_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        restore_btn.setStyleSheet("""
-            QPushButton { 
-                background: transparent; 
-                border: none; 
-                border-radius: 6px;
-                outline: none;
-            }
-            QPushButton:hover { background: rgba(255, 255, 255, 20); }
-        """)
-        restore_btn.clicked.connect(self.on_restore_defaults)
-        bottom_layout.addWidget(restore_btn)
-        
-        # Settings icon
-        settings_icon = QtWidgets.QPushButton()
-        settings_icon.setIcon(QtGui.QIcon(assets.icon_gear))
-        settings_icon.setIconSize(QtCore.QSize(18, 18))
-        settings_icon.setFlat(True)
-        settings_icon.setFixedSize(32, 32)
-        settings_icon.setEnabled(False)
-        settings_icon.setStyleSheet("""
-            QPushButton { 
-                background: transparent; 
-                border: none; 
-                outline: none;
-            }
-        """)
-        bottom_layout.addWidget(settings_icon)
-        
-        bottom_layout.addStretch()
-        bottom_buttons.setLayout(bottom_layout)
-        sidebar_layout.addWidget(bottom_buttons)
-        
+        # We don't need bottom sidebar buttons, as we'll use our dialog native buttons bottom bar.
         main_layout.addWidget(sidebar)
         
         # --- RIGHT CONTENT AREA ---
@@ -445,9 +438,31 @@ class SettingsDialog(QtWidgets.QDialog):
         kbd_layout.addWidget(QtWidgets.QLabel('Keyboard shortcuts would go here'))
         kbd_layout.addStretch()
         self.stacked_widget.addWidget(kbd_page)
+
+        # Collaboration page
+        collab_page = QtWidgets.QWidget()
+        collab_layout = QtWidgets.QVBoxLayout(collab_page)
+        collab_layout.addWidget(CollaborationUsernameWidget())
+        collab_layout.addStretch()
+        self.stacked_widget.addWidget(collab_page)
         
         content_layout.addWidget(self.stacked_widget)
         main_layout.addWidget(content_widget, 1)
+
+        # Bottom buttons native
+        self.close_btn = self._create_button("Close")
+        self.close_btn.clicked.connect(self.reject)
+        
+        sep = QtWidgets.QFrame()
+        sep.setFixedWidth(1)
+        sep.setStyleSheet("background-color: rgba(255, 255, 255, 0.1); border: none;")
+        
+        self.restore_btn = self._create_button("Restore Defaults", is_destructive=True)
+        self.restore_btn.clicked.connect(self.on_restore_defaults)
+
+        self.button_layout.addWidget(self.close_btn)
+        self.button_layout.addWidget(sep)
+        self.button_layout.addWidget(self.restore_btn)
         
         # Select first category by default
         self.category_buttons[0].click()
@@ -476,10 +491,11 @@ class SettingsDialog(QtWidgets.QDialog):
         self.selected_category = category
 
     def on_restore_defaults(self, *args, **kwargs):
-        reply = QtWidgets.QMessageBox.question(
+        from threecolref.widgets.ios_dialogs import BeeIosMessageDialog
+        reply = BeeIosMessageDialog.show_message(
             self,
             'Restore defaults?',
             'Do you want to restore all settings to their default values?')
 
-        if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+        if reply == "OK":
             BeeSettings().restore_defaults()

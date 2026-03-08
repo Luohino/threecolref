@@ -1,4 +1,4 @@
-USER_VERSION = 3
+USER_VERSION = 4
 APPLICATION_ID = 2060242126
 
 
@@ -13,7 +13,9 @@ SCHEMA = [
         scale REAL DEFAULT 1,
         rotation REAL DEFAULT 0,
         flip INTEGER DEFAULT 1,
-        data JSON
+        parent_id INTEGER,
+        data JSON,
+        FOREIGN KEY (parent_id) REFERENCES items (id) ON DELETE SET NULL
     )
     """,
     """
@@ -51,5 +53,8 @@ MIGRATIONS = {
             value BLOB
         )
         """
+    ],
+    4: [
+        "ALTER TABLE items ADD COLUMN parent_id INTEGER REFERENCES items(id) ON DELETE SET NULL",
     ],
 }

@@ -22,22 +22,20 @@ from PyQt6.QtCore import Qt
 from threecolref import constants, commands
 from threecolref.actions.actions import bee_actions
 from threecolref.config import logfile_name
-from . import controls, settings, welcome_overlay, color_gamut
+from . import controls, settings, welcome_overlay, color_gamut, ios_dialogs
 from .hierarchy import HierarchyOverlay
 
 
 logger = logging.getLogger(__name__)
 
 
-class BeeProgressDialog(QtWidgets.QProgressDialog):
-
-    def __init__(self, label, worker, maximum=0, parent=None):
-        super().__init__(label, 'Cancel', 0, maximum, parent=parent)
-        logger.debug('Initialised progress bar')
-        self.setMinimumDuration(0)
-        self.setWindowModality(Qt.WindowModality.WindowModal)
-        self.setAutoReset(False)
-        self.setAutoClose(False)
+class BeeProgressDialog(ios_dialogs.BeeIosProgressDialog):
+    """Refactored to use iOS-style dialog base."""
+    def __init__(self, label, worker, maximum=0, parent=None, title="Progress"):
+        super().__init__(label, parent=parent, title=title)
+        logger.debug('Initialised progress bar (iOS style)')
+        self.setMaximum(maximum)
+        
         worker.begin_processing.connect(self.on_begin_processing)
         worker.progress.connect(self.on_progress)
         worker.finished.connect(self.on_finished)
@@ -49,23 +47,24 @@ class BeeProgressDialog(QtWidgets.QProgressDialog):
         self.setValue(value)
 
     def on_begin_processing(self, value):
-        logger.debug(f'Beginn progress dialog: {value}')
+        logger.debug(f'Begin progress dialog: {value}')
         self.setMaximum(value)
 
     def on_finished(self, *args, **kwargs):
         logger.debug('Finished progress dialog')
         self.setValue(self.maximum())
         self.reset()
-        self.hide()
         QtCore.QTimer.singleShot(100, self.deleteLater)
 
 
-class HelpDialog(QtWidgets.QDialog):
+class HelpDialog(ios_dialogs._IosDialogBase):
     def __init__(self, parent):
-        super().__init__(parent)
-        self.setWindowTitle(f'{constants.APPNAME} Help')
+        super().__init__(parent, f'{constants.APPNAME} Help')
+        self.setMinimumWidth(800)
+        self.setMinimumHeight(600)
 
-        tabs = QtWidgets.QTabWidget()
+        tabs = QtWidgets.QTabWidget(self.container)
+        tabs.setStyleSheet("color: white; background-color: transparent;")
 
         # Controls
         controls_txt = rsc_files(
@@ -73,50 +72,57 @@ class HelpDialog(QtWidgets.QDialog):
         controls_label = QtWidgets.QLabel(controls_txt)
         controls_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
-        scroll = QtWidgets.QScrollArea(self)
+        scroll = QtWidgets.QScrollArea(self.container)
         scroll.setWidgetResizable(True)
         scroll.setWidget(controls_label)
         tabs.addTab(scroll, '&Controls')
 
-        layout = QtWidgets.QVBoxLayout()
-        self.setLayout(layout)
-        layout.addWidget(tabs)
+        self.content_layout.addWidget(tabs)
+        self.content_layout.addSpacing(10)
 
         # Bottom row of buttons
-        buttons = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.StandardButton.Close)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        self.close_btn = self._create_button("Close", is_primary=True)
+        self.close_btn.clicked.connect(self.reject)
+        self.button_layout.addWidget(self.close_btn)
 
         self.show()
 
 
-class DebugLogDialog(QtWidgets.QDialog):
+class DebugLogDialog(ios_dialogs._IosDialogBase):
     def __init__(self, parent):
-        super().__init__(parent)
-        self.setWindowTitle(f'{constants.APPNAME} Debug Log')
+        super().__init__(parent, f'{constants.APPNAME} Debug Log')
+        self.setMinimumWidth(800)
+        self.setMinimumHeight(600)
+        
         with open(logfile_name()) as f:
             self.log_txt = f.read()
 
-        self.log = QtWidgets.QPlainTextEdit(self.log_txt)
-        self.log.setReadOnly(True)
-
-        buttons = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.StandardButton.Close)
-        buttons.rejected.connect(self.reject)
-        self.copy_button = QtWidgets.QPushButton('Co&py To Clipboard')
-        self.copy_button.released.connect(self.copy_to_clipboard)
-        buttons.addButton(
-            self.copy_button, QtWidgets.QDialogButtonBox.ButtonRole.ActionRole)
-
-        layout = QtWidgets.QVBoxLayout()
-        self.setLayout(layout)
-        name_widget = QtWidgets.QLabel(logfile_name())
+        name_widget = QtWidgets.QLabel(logfile_name(), self.container)
         name_widget.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(name_widget)
-        layout.addWidget(self.log)
-        layout.addWidget(buttons)
+        name_widget.setStyleSheet("color: rgba(255,255,255,0.7); font-size: 12px;")
+        self.content_layout.addWidget(name_widget)
+
+        self.log = QtWidgets.QPlainTextEdit(self.log_txt, self.container)
+        self.log.setReadOnly(True)
+        self.log.setStyleSheet("background-color: rgba(0,0,0,0.3); color: white; border-radius: 6px; padding: 5px;")
+        self.content_layout.addWidget(self.log)
+        self.content_layout.addSpacing(10)
+
+        self.close_btn = self._create_button("Close")
+        self.close_btn.clicked.connect(self.reject)
+        
+        sep = QtWidgets.QFrame()
+        sep.setFixedWidth(1)
+        sep.setStyleSheet("background-color: rgba(255, 255, 255, 0.1); border: none;")
+        
+        self.copy_btn = self._create_button("Copy To Clipboard", is_primary=True)
+        self.copy_btn.clicked.connect(self.copy_to_clipboard)
+
+        self.button_layout.addWidget(self.close_btn)
+        self.button_layout.addWidget(sep)
+        self.button_layout.addWidget(self.copy_btn)
+
         self.show()
 
     def copy_to_clipboard(self):
@@ -124,12 +130,67 @@ class DebugLogDialog(QtWidgets.QDialog):
         clipboard.setText(self.log_txt)
 
 
-class SceneToPixmapExporterDialog(QtWidgets.QDialog):
+class AboutDialog(ios_dialogs._IosDialogBase):
+    def __init__(self, parent):
+        super().__init__(parent, f'About {constants.APPNAME}')
+        self.setMinimumWidth(380)
+
+        main_layout = QtWidgets.QHBoxLayout()
+        main_layout.setSpacing(20)
+        self.content_layout.addLayout(main_layout)
+
+        # Left Column: Logo
+        from threecolref.assets import BeeAssets
+        logo_label = QtWidgets.QLabel(self.container)
+        logo_label.setPixmap(BeeAssets().logo.pixmap(90, 90))
+        logo_label.setAlignment(Qt.AlignmentFlag.AlignTop)
+        
+        logo_layout = QtWidgets.QVBoxLayout()
+        logo_layout.addWidget(logo_label)
+        logo_layout.addStretch()
+        main_layout.addLayout(logo_layout)
+
+        # Right Column: Details
+        details_layout = QtWidgets.QVBoxLayout()
+        details_layout.setSpacing(15)
+
+        title = QtWidgets.QLabel(f"{constants.APPNAME} {constants.VERSION}", self.container)
+        title.setStyleSheet("color: white; font-size: 20px; font-weight: bold;")
+        details_layout.addWidget(title)
+
+        fullname = QtWidgets.QLabel(constants.APPNAME_FULL, self.container)
+        fullname.setStyleSheet("color: rgba(255, 255, 255, 0.85); font-size: 13px;")
+        details_layout.addWidget(fullname)
+
+        copyright = QtWidgets.QLabel(constants.COPYRIGHT, self.container)
+        copyright.setStyleSheet("color: rgba(255, 255, 255, 0.7); font-size: 12px;")
+        details_layout.addWidget(copyright)
+
+        link_label = QtWidgets.QLabel(
+            f'<a href="{constants.WEBSITE}" style="color: #0A84FF; text-decoration: none;">Visit the {constants.APPNAME} website</a>',
+            self.container)
+        link_label.setOpenExternalLinks(True)
+        link_label.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse)
+        details_layout.addWidget(link_label)
+        details_layout.addStretch()
+        
+        main_layout.addLayout(details_layout)
+        self.content_layout.addSpacing(20)
+
+        # Buttons
+        self.ok_btn = self._create_button("OK", is_primary=True)
+        self.ok_btn.clicked.connect(self.accept)
+        self.button_layout.addWidget(self.ok_btn)
+
+        self.show()
+
+
+class SceneToPixmapExporterDialog(ios_dialogs._IosDialogBase):
     MIN_SIZE = 10
     MAX_SIZE = 100000
 
     def __init__(self, parent, default_size):
-        super().__init__(parent)
+        super().__init__(parent, 'Export Scene to Image')
         self.default_size = default_size
         if (self.default_size.width() > self.MAX_SIZE
                 or self.default_size.width() >= self.MAX_SIZE):
@@ -138,36 +199,47 @@ class SceneToPixmapExporterDialog(QtWidgets.QDialog):
                 Qt.AspectRatioMode.KeepAspectRatio)
 
         self.ignore_change = False
-        self.setWindowTitle('Export Scene to Image')
-        self.setWindowModality(Qt.WindowModality.WindowModal)
+        
         layout = QtWidgets.QGridLayout()
-        self.setLayout(layout)
+        self.content_layout.addLayout(layout)
 
-        width_label = QtWidgets.QLabel('Width:')
+        width_label = QtWidgets.QLabel('Width:', self.container)
+        width_label.setStyleSheet("color: white;")
         layout.addWidget(width_label, 0, 0)
-        self.width_input = QtWidgets.QSpinBox()
+        self.width_input = QtWidgets.QSpinBox(self.container)
+        self.width_input.setStyleSheet("background-color: rgba(255,255,255,0.1); color: white; border-radius: 4px; padding: 4px;")
         self.width_input.setRange(self.MIN_SIZE, self.MAX_SIZE)
         self.width_input.setValue(default_size.width())
         self.width_input.valueChanged.connect(self.on_width_changed)
         layout.addWidget(self.width_input, 0, 1)
 
-        height_label = QtWidgets.QLabel('Height:')
+        height_label = QtWidgets.QLabel('Height:', self.container)
+        height_label.setStyleSheet("color: white;")
         layout.addWidget(height_label, 1, 0)
-        self.height_input = QtWidgets.QSpinBox()
+        self.height_input = QtWidgets.QSpinBox(self.container)
+        self.height_input.setStyleSheet("background-color: rgba(255,255,255,0.1); color: white; border-radius: 4px; padding: 4px;")
         self.height_input.setMinimum(10)
         self.height_input.setRange(self.MIN_SIZE, self.MAX_SIZE)
         self.height_input.setValue(default_size.height())
         self.height_input.valueChanged.connect(self.on_height_changed)
         layout.addWidget(self.height_input, 1, 1)
 
-        # Bottom row of buttons
-        buttons = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.StandardButton.Ok |
-            QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        self.content_layout.addSpacing(15)
 
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons, 3, 1)
+        # Bottom row of buttons
+        self.cancel_btn = self._create_button("Cancel")
+        self.cancel_btn.clicked.connect(self.reject)
+        
+        sep = QtWidgets.QFrame()
+        sep.setFixedWidth(1)
+        sep.setStyleSheet("background-color: rgba(255, 255, 255, 0.1); border: none;")
+        
+        self.ok_btn = self._create_button("OK", is_primary=True)
+        self.ok_btn.clicked.connect(self.accept)
+
+        self.button_layout.addWidget(self.cancel_btn)
+        self.button_layout.addWidget(sep)
+        self.button_layout.addWidget(self.ok_btn)
 
     def on_width_changed(self, width):
         if not self.ignore_change:
@@ -190,38 +262,41 @@ class SceneToPixmapExporterDialog(QtWidgets.QDialog):
                             self.height_input.value())
 
 
-class ChangeOpacityDialog(QtWidgets.QDialog):
+class ChangeOpacityDialog(ios_dialogs._IosDialogBase):
 
     def __init__(self, parent, images, undo_stack):
-        super().__init__(parent)
+        super().__init__(parent, 'Change Opacity:')
         self.undo_stack = undo_stack
         self.images = images
         self.command = commands.ChangeOpacity(images, opacity=1)
 
         value = int(images[0].opacity() * 100) if images else 100
 
-        self.setWindowTitle('Change Opacity:')
-        self.setWindowModality(Qt.WindowModality.WindowModal)
-        layout = QtWidgets.QVBoxLayout()
-        self.setLayout(layout)
+        self.label = QtWidgets.QLabel('Opacity:', self.container)
+        self.label.setStyleSheet("color: white;")
+        self.content_layout.addWidget(self.label)
 
-        self.label = QtWidgets.QLabel('Opacity:')
-        layout.addWidget(self.label)
-
-        self.input = QtWidgets.QSlider(Qt.Orientation.Horizontal)
+        self.input = QtWidgets.QSlider(Qt.Orientation.Horizontal, self.container)
         self.input.valueChanged.connect(self.on_value_changed)
         self.input.setRange(0, 100)
         self.input.setValue(value)
-        layout.addWidget(self.input)
+        self.content_layout.addWidget(self.input)
+        self.content_layout.addSpacing(15)
 
         # Bottom row of buttons
-        buttons = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.StandardButton.Ok |
-            QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        self.cancel_btn = self._create_button("Cancel")
+        self.cancel_btn.clicked.connect(self.reject)
+        
+        sep = QtWidgets.QFrame()
+        sep.setFixedWidth(1)
+        sep.setStyleSheet("background-color: rgba(255, 255, 255, 0.1); border: none;")
+        
+        self.ok_btn = self._create_button("OK", is_primary=True)
+        self.ok_btn.clicked.connect(self.accept)
 
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        self.button_layout.addWidget(self.cancel_btn)
+        self.button_layout.addWidget(sep)
+        self.button_layout.addWidget(self.ok_btn)
 
         self.show()
 
@@ -270,35 +345,43 @@ class BeeNotification(QtWidgets.QWidget):
 
 
 class BeeWindowButton(QtWidgets.QPushButton):
-    """Minimalist window control button."""
+    """iOS/macOS traffic-light style window control button."""
+
+    # Circle colors for each button type
+    COLORS = {
+        'close':  (QtGui.QColor(255, 95, 87),  QtGui.QColor(220, 60, 54)),   # red
+        'min':    (QtGui.QColor(255, 189, 46), QtGui.QColor(222, 160, 30)),   # yellow
+        'max':    (QtGui.QColor(39, 201, 63),  QtGui.QColor(28, 175, 48)),    # green
+        'pin':    (QtGui.QColor(80, 160, 255), QtGui.QColor(50, 130, 230)),   # blue
+    }
+
     def __init__(self, parent, btn_type, callback=None):
         super().__init__(parent)
         self.btn_type = btn_type
-        self.setFixedSize(28, 24)
+        self.setFixedSize(20, 20)
         self.setFlat(True)
         self.setCheckable(btn_type == 'pin')
         self.setCursor(Qt.CursorShape.ArrowCursor)
-        self.is_checked = False # Used for Pin button
+        self.is_checked = False
+        self._hovered = False
         if callback:
             self.clicked.connect(callback)
-        
-        # Ensure buttons receive mouse events and stop propagation
+
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         self.setMouseTracking(True)
-        self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def enterEvent(self, event):
-        # Force cursor reset on entry
+        self._hovered = True
         self.setCursor(Qt.CursorShape.ArrowCursor)
         super().enterEvent(event)
         self.update()
 
     def leaveEvent(self, event):
+        self._hovered = False
         super().leaveEvent(event)
         self.update()
 
     def mouseReleaseEvent(self, event):
-        # Stop event propagation
         event.accept()
         super().mouseReleaseEvent(event)
 
@@ -310,283 +393,207 @@ class BeeWindowButton(QtWidgets.QPushButton):
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
-        
+
         w, h = self.width(), self.height()
-        cx, cy = w // 2, h // 2
-        
-        # Draw hover background
-        if self.underMouse():
-            painter.setPen(Qt.PenStyle.NoPen)
+        cx, cy = w / 2.0, h / 2.0
+        radius = 6.0
+
+        normal_color, hover_color = self.COLORS.get(
+            self.btn_type, (QtGui.QColor(120, 120, 120), QtGui.QColor(100, 100, 100)))
+
+        # For pin button: brighter when checked
+        if self.btn_type == 'pin' and self.is_checked:
+            fill = QtGui.QColor(60, 180, 255)
+        elif self._hovered:
+            fill = hover_color
+        else:
+            fill = normal_color
+
+        # Draw circle
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(fill)
+        painter.drawEllipse(QtCore.QPointF(cx, cy), radius, radius)
+
+        # Draw glyph on hover
+        if self._hovered or (self.btn_type == 'pin' and self.is_checked):
+            glyph_color = QtGui.QColor(70, 0, 0) if self.btn_type == 'close' else QtGui.QColor(50, 50, 50)
+            if self.btn_type == 'pin' and self.is_checked:
+                glyph_color = QtGui.QColor(255, 255, 255)
+            pen = QtGui.QPen(glyph_color)
+            pen.setWidthF(1.4)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+
             if self.btn_type == 'close':
-                painter.setBrush(QtGui.QColor(232, 17, 35, 200)) # Red
-            else:
-                painter.setBrush(QtGui.QColor(255, 255, 255, 25)) # Light highlight
-                
-            margin = 2
-            from PyQt6.QtCore import QRectF
-            rect = QRectF(margin, margin, w - 2*margin, h - 2*margin)
-            painter.drawRoundedRect(rect, 4, 4)
-            
-        # Determine icon color
-        icon_color = QtGui.QColor(200, 200, 200)
-        if self.underMouse() and self.btn_type == 'close':
-            icon_color = QtGui.QColor(255, 255, 255)
-            
-        pen = QtGui.QPen(icon_color)
-        pen.setWidth(1)
-        painter.setPen(pen)
-        
-        if self.btn_type == 'close':
-            size = 4
-            painter.drawLine(cx - size, cy - size, cx + size, cy + size)
-            painter.drawLine(cx + size, cy - size, cx - size, cy + size)
-        elif self.btn_type == 'min':
-            size = 5
-            painter.drawLine(cx - size, cy, cx + size, cy)
-        elif self.btn_type == 'max':
-            # Maximize: single square. Restore: two overlapping squares
-            size = 4
-            mw = getattr(self, '_main_window', None)
-            is_maximized = mw.isMaximized() if mw else False
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            if is_maximized:
-                # Restore icon: two overlapping squares
-                painter.drawRect(cx - size, cy - size + 2, size * 2, size * 2)
-                painter.drawRect(cx - size + 2, cy - size - 2, size * 2, size * 2)
-            else:
-                # Maximize icon: single square (fullscreen)
-                painter.drawRect(cx - size, cy - size, size * 2, size * 2)
-        elif self.btn_type == 'pin':
-            # Custom push-pin icon based on provided SVG, adjusted for weight and state
-            painter.save()
-            painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
-
-            # Use white when active (checked), otherwise theme gray/hover color
-            color = QtGui.QColor(255, 255, 255) if self.is_checked else icon_color
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QtGui.QBrush(color))
-
-            painter.translate(cx, cy)
-            painter.scale(0.5, 0.5) # Scale to fit vertically
-            # Move it UP by decreasing the Y translation (more negative)
-            # Full path Y range is [4, 23], center is 13.5. 
-            # Shifting to -16 moves it up by 2.5 pixels in path-space (~1.25 pixels in button-space at 0.5 scale)
-            painter.translate(-12, -15.5) 
-
-            path = QtGui.QPainterPath()
-            path.setFillRule(Qt.FillRule.WindingFill if self.is_checked else Qt.FillRule.OddEvenFill)
-            
-            # Restore FULL Outer boundary from pin-svgrepo-com.svg
-            path.moveTo(6.5, 5)
-            path.cubicTo(6.5, 4.45, 6.95, 4, 7.5, 4)
-            path.lineTo(9, 4)
-            path.lineTo(15, 4)
-            path.lineTo(16.5, 4)
-            path.cubicTo(17.05, 4, 17.5, 4.45, 17.5, 5)
-            path.cubicTo(17.5, 5.55, 17.05, 6, 16.5, 6)
-            path.lineTo(16.095, 6)
-            path.lineTo(16.913, 15)
-            path.lineTo(19, 15)
-            path.cubicTo(19.55, 15, 20, 15.45, 20, 16)
-            path.cubicTo(20, 16.55, 19.55, 17, 19, 17)
-            path.lineTo(16, 17)
-            path.lineTo(13, 17)
-            path.lineTo(13, 22)
-            path.cubicTo(13, 22.55, 12.55, 23, 12, 23)
-            path.cubicTo(11.45, 23, 11, 22.55, 11, 22)
-            path.lineTo(11, 17)
-            path.lineTo(8, 17)
-            path.lineTo(5, 17)
-            path.cubicTo(4.45, 17, 4, 16.55, 4, 16)
-            path.cubicTo(4, 15.45, 4.45, 15, 5, 15)
-            path.lineTo(7.087, 15)
-            path.lineTo(7.905, 6)
-            path.lineTo(7.5, 6)
-            path.cubicTo(6.95, 6, 6.5, 5.55, 6.5, 5)
-            path.closeSubpath()
-
-            # Inner cutout (makes it an outline when inactive)
-            if not self.is_checked:
-                path.moveTo(9.913, 6)
-                path.lineTo(9.095, 15)
-                path.lineTo(12, 15)
-                path.lineTo(14.905, 15)
-                path.lineTo(14.087, 6)
-                path.lineTo(9.913, 6)
+                s = 3.0
+                painter.drawLine(QtCore.QPointF(cx - s, cy - s), QtCore.QPointF(cx + s, cy + s))
+                painter.drawLine(QtCore.QPointF(cx + s, cy - s), QtCore.QPointF(cx - s, cy + s))
+            elif self.btn_type == 'min':
+                s = 3.5
+                painter.drawLine(QtCore.QPointF(cx - s, cy), QtCore.QPointF(cx + s, cy))
+            elif self.btn_type == 'max':
+                mw = getattr(self, '_main_window', None)
+                is_maximized = mw.isMaximized() if mw else False
+                if is_maximized:
+                    # Two small overlapping rects (restore icon)
+                    s = 2.5
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawRect(QtCore.QRectF(cx - s, cy - s + 1, s * 2 - 1, s * 2 - 1))
+                    painter.drawRect(QtCore.QRectF(cx - s + 1.5, cy - s - 0.5, s * 2 - 1, s * 2 - 1))
+                else:
+                    # Triangle/arrow pointing top-left + bottom-right (fullscreen)
+                    s = 3.0
+                    # Draw two opposing arrows
+                    painter.drawLine(QtCore.QPointF(cx - s, cy - s), QtCore.QPointF(cx + s, cy + s))
+                    # arrowhead top-left
+                    painter.drawLine(QtCore.QPointF(cx - s, cy - s), QtCore.QPointF(cx - s + 2.5, cy - s))
+                    painter.drawLine(QtCore.QPointF(cx - s, cy - s), QtCore.QPointF(cx - s, cy - s + 2.5))
+                    # arrowhead bottom-right
+                    painter.drawLine(QtCore.QPointF(cx + s, cy + s), QtCore.QPointF(cx + s - 2.5, cy + s))
+                    painter.drawLine(QtCore.QPointF(cx + s, cy + s), QtCore.QPointF(cx + s, cy + s - 2.5))
+            elif self.btn_type == 'pin':
+                # Small pin glyph
+                painter.save()
+                painter.translate(cx, cy)
+                painter.scale(0.28, 0.28)
+                painter.translate(-12, -15.5)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QtGui.QBrush(glyph_color))
+                path = QtGui.QPainterPath()
+                path.setFillRule(Qt.FillRule.WindingFill)
+                path.moveTo(6.5, 5)
+                path.cubicTo(6.5, 4.45, 6.95, 4, 7.5, 4)
+                path.lineTo(16.5, 4)
+                path.cubicTo(17.05, 4, 17.5, 4.45, 17.5, 5)
+                path.cubicTo(17.5, 5.55, 17.05, 6, 16.5, 6)
+                path.lineTo(16.095, 6)
+                path.lineTo(16.913, 15)
+                path.lineTo(19, 15)
+                path.cubicTo(19.55, 15, 20, 15.45, 20, 16)
+                path.cubicTo(20, 16.55, 19.55, 17, 19, 17)
+                path.lineTo(13, 17)
+                path.lineTo(13, 22)
+                path.cubicTo(13, 22.55, 12.55, 23, 12, 23)
+                path.cubicTo(11.45, 23, 11, 22.55, 11, 22)
+                path.lineTo(11, 17)
+                path.lineTo(5, 17)
+                path.cubicTo(4.45, 17, 4, 16.55, 4, 16)
+                path.cubicTo(4, 15.45, 4.45, 15, 5, 15)
+                path.lineTo(7.087, 15)
+                path.lineTo(7.905, 6)
+                path.lineTo(7.5, 6)
+                path.cubicTo(6.95, 6, 6.5, 5.55, 6.5, 5)
                 path.closeSubpath()
-
-            painter.drawPath(path)
-            painter.restore()
+                painter.drawPath(path)
+                painter.restore()
 
 
 
 
 
 class BeeTitleBar(QtWidgets.QWidget):
-    """Integrated title bar that auto-hides like PureRef and is resizable in height."""
+    """iOS-style title bar — always visible, clean frosted-glass look."""
+
+    TITLE_HEIGHT = 38
 
     def __init__(self, parent, view):
         super().__init__(parent)
         self.view = view
         self.main_window = parent.window()
 
-        self._expanded_height = 30
-        self._collapsed_height = 4
-        self._expanded = False
-        self._resizing_height = False
-        self._resize_start_y = None
-        self._resize_start_height = None
-        self._resize_margin = 4
-
         self.setObjectName("beeTitleBar")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFixedHeight(self.TITLE_HEIGHT)
+        self.setMouseTracking(True)
 
         layout = QtWidgets.QHBoxLayout(self)
-        layout.setContentsMargins(10, 0, 0, 0)
-        layout.setSpacing(10)
+        layout.setContentsMargins(12, 0, 12, 0)
+        layout.setSpacing(0)
 
-        # Left: App Icon and Title
-        self.icon_label = QtWidgets.QLabel()
-        from threecolref.assets import BeeAssets
-
-        self.icon_label.setPixmap(BeeAssets().logo.pixmap(16, 16))
-        self.icon_label.setCursor(Qt.CursorShape.ArrowCursor)
-        layout.addWidget(self.icon_label)
-
-        self.title_label = QtWidgets.QLabel(constants.APPNAME)
-        self.title_label.setStyleSheet("font-size: 11px; font-weight: bold;")
-        self.title_label.setCursor(Qt.CursorShape.ArrowCursor)
-        layout.addWidget(self.title_label)
-
-        # Middle: Stretch
-        layout.addStretch()
-
-        # Right: Window Controls
+        # LEFT — traffic-light controls
         self.controls = BeeWindowControls(self, view)
         layout.addWidget(self.controls)
 
-        # Base cursor for title bar is standard arrow
-        self.setCursor(Qt.CursorShape.ArrowCursor)
-        self.setMouseTracking(True)
-        self.icon_label.setMouseTracking(True)
-        self.title_label.setMouseTracking(True)
-        self.controls.setMouseTracking(True)
+        # CENTER — title (stretch on both sides to keep it centered)
+        layout.addStretch(1)
+
+        self.title_label = QtWidgets.QLabel(constants.APPNAME)
+        self.title_label.setStyleSheet(
+            "font-size: 12px; font-weight: 600; color: rgba(255,255,255,0.85); background: transparent;")
+        self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.title_label.setCursor(Qt.CursorShape.ArrowCursor)
+        layout.addWidget(self.title_label)
+
+        layout.addStretch(1)
+
+        # RIGHT — app icon (small branding)
+        self.icon_label = QtWidgets.QLabel()
+        from threecolref.assets import BeeAssets
+        self.icon_label.setPixmap(BeeAssets().logo.pixmap(16, 16))
+        self.icon_label.setCursor(Qt.CursorShape.ArrowCursor)
+        self.icon_label.setStyleSheet("background: transparent;")
+        layout.addWidget(self.icon_label)
+
+        # Apply iOS-style background
+        self._apply_style()
 
         self._dragging_window = False
-        self._resizing_height = False
         self._drag_start_pos = None
+        self.setCursor(Qt.CursorShape.ArrowCursor)
 
-        # Start collapsed; expand on hover
-        self._set_collapsed()
-
-    def _set_expanded(self):
-        self._expanded = True
-        self.setMinimumHeight(self._expanded_height)
-        self.setMaximumHeight(200)  # Allow resizing up to 200px
-        self.setFixedHeight(self._expanded_height)
+    def _apply_style(self):
         self.setStyleSheet("""
-            QWidget#beeTitleBar { background-color: #1e1e1e; }
-            QLabel { color: #cccccc; background-color: transparent; }
+            QWidget#beeTitleBar {
+                background: qlineargradient(
+                    x1:0, y1:0, x2:0, y2:1,
+                    stop:0 rgba(44, 44, 48, 245),
+                    stop:1 rgba(34, 34, 38, 245));
+                border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+            }
+            QLabel {
+                color: rgba(255, 255, 255, 0.85);
+                background: transparent;
+            }
         """)
-        self.icon_label.show()
-        self.title_label.show()
-        self.controls.show()
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
-        self._update_overlay_geometry()
-
-    def _set_collapsed(self):
-        self._expanded = False
-        self.setFixedHeight(self._collapsed_height)
-        self.setStyleSheet("""
-            QWidget#beeTitleBar { background-color: transparent; }
-            QLabel { color: #cccccc; background-color: transparent; }
-        """)
-        self.icon_label.hide()
-        self.title_label.hide()
-        self.controls.hide()
-        self._update_overlay_geometry()
 
     def _update_overlay_geometry(self):
-        """Keep overlay at top, full width (parent may be BeeMainWidget)."""
+        """Keep overlay at top, full width."""
         p = self.parent()
         if p and hasattr(p, 'width'):
-            self.setGeometry(0, 0, p.width(), self.height())
+            self.setGeometry(0, 0, p.width(), self.TITLE_HEIGHT)
 
+    # --- No hover expand/collapse — always visible ---
     def enterEvent(self, event):
-        self._set_expanded()
         super().enterEvent(event)
 
     def leaveEvent(self, event):
-        # Collapse when mouse leaves the title bar
-        self._set_collapsed()
         super().leaveEvent(event)
 
+    # --- Window dragging ---
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            pos = event.pos()
-            
-            is_interactive = False
-            # Allow interacting with controls
-            if self.controls.geometry().contains(pos):
-                is_interactive = True
-                
-            if not is_interactive:
-                if pos.y() >= self.height() - self._resize_margin:
-                    self._resizing_height = True
-                    self._resize_start_y = event.globalPosition().y()
-                    self._resize_start_height = self.height()
-                    event.accept()
-                else:
-                    self._dragging_window = True
-                    self._drag_start_pos = event.globalPosition().toPoint()
-                    event.accept()
+            # Don't drag if clicking on controls
+            if self.controls.geometry().contains(event.pos()):
+                super().mousePressEvent(event)
+                return
+            # Start window drag using native system move for reliable behavior
+            wh = self.main_window.windowHandle()
+            if wh is not None:
+                wh.startSystemMove()
+                event.accept()
+                return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        if not self._expanded:
+        # Just keep arrow cursor in title bar area (no resize from title bar)
+        if self.controls.geometry().contains(event.pos()):
             self.setCursor(Qt.CursorShape.ArrowCursor)
-            super().mouseMoveEvent(event)
-            return
-
-        pos = event.pos()
-        x, y = pos.x(), pos.y()
-
-        # Check if over controls or labels
-        is_over_interactive = False
-        if self.icon_label.isVisible() and self.icon_label.geometry().contains(pos):
-            is_over_interactive = True
-        if self.title_label.isVisible() and self.title_label.geometry().contains(pos):
-            is_over_interactive = True
-        if self.controls.isVisible() and self.controls.geometry().contains(pos):
-            is_over_interactive = True
-
-        if is_over_interactive:
+        else:
             self.setCursor(Qt.CursorShape.ArrowCursor)
-        elif y >= self.height() - self._resize_margin:
-            self.setCursor(Qt.CursorShape.SizeVerCursor)
-        else:
-            self.setCursor(Qt.CursorShape.SizeAllCursor)
-
-        # Handle window dragging and resizing
-        if self._resizing_height:
-            delta_y = event.globalPosition().y() - self._resize_start_y
-            new_height = max(self._expanded_height, 
-                             min(200, self._resize_start_height + delta_y))
-            self.setFixedHeight(int(new_height))
-            event.accept()
-        elif self._dragging_window:
-            if self._drag_start_pos is not None:
-                delta = event.globalPosition().toPoint() - self._drag_start_pos
-                new_pos = self.main_window.pos() + delta
-                self.main_window.move(new_pos)
-                self._drag_start_pos = event.globalPosition().toPoint()
-                event.accept()
-        else:
-            super().mouseMoveEvent(event)
+        super().mouseMoveEvent(event)
 
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            # Don't toggle maximize if double-clicking on controls
             if not self.controls.geometry().contains(event.pos()):
                 self.controls.toggle_maximized()
                 event.accept()
@@ -595,67 +602,58 @@ class BeeTitleBar(QtWidgets.QWidget):
 
     def mouseReleaseEvent(self, event):
         self._dragging_window = False
-        self._resizing_height = False
         self._drag_start_pos = None
         super().mouseReleaseEvent(event)
 
 
 class BeeWindowControls(QtWidgets.QWidget):
-    """Container for Pin, Min, Max, and Close buttons."""
+    """iOS traffic-light container — Close, Min, Max, Pin (left-aligned)."""
     def __init__(self, parent, view):
         super().__init__(parent)
         self.view = view
         self.main_window = parent.window()
-        
+
         layout = QtWidgets.QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
+        layout.setSpacing(4)
 
-        self.pin_btn = BeeWindowButton(self, 'pin')
-        self.pin_btn.setToolTip('Always On Top (Ctrl+Shift+A)')
-        
+        # macOS order: close, minimize, maximize — then pin
+        self.close_btn = BeeWindowButton(self, 'close', self.main_window.close)
+        self.close_btn.setToolTip('Close')
         self.min_btn = BeeWindowButton(self, 'min', self.toggle_minimize)
         self.min_btn.setToolTip('Minimize')
         self.max_btn = BeeWindowButton(self, 'max', self.toggle_maximized)
-        self.max_btn.setToolTip('Maximize / Restore (centered)')
-        self.close_btn = BeeWindowButton(self, 'close', self.main_window.close)
-        self.close_btn.setToolTip('Close')
+        self.max_btn.setToolTip('Maximize / Restore')
+        self.pin_btn = BeeWindowButton(self, 'pin')
+        self.pin_btn.setToolTip('Always On Top (Ctrl+Shift+A)')
 
-        layout.addWidget(self.pin_btn)
+        layout.addWidget(self.close_btn)
         layout.addWidget(self.min_btn)
         layout.addWidget(self.max_btn)
-        layout.addWidget(self.close_btn)
-        
+        layout.addWidget(self.pin_btn)
+
         self.pin_btn.clicked.connect(self.on_pin_clicked)
-        # Update max/restore icon when window state changes
         self.main_window.windowStateChanged.connect(self._on_window_state_changed)
-        self.max_btn._main_window = self.main_window  # For max/restore icon state
-        
-        # Ensure controls widget receives mouse events and has a standard pointer
+        self.max_btn._main_window = self.main_window
+
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         self.setCursor(Qt.CursorShape.ArrowCursor)
         self.show()
 
-    
     def mousePressEvent(self, event):
-        # Stop event propagation - don't let title bar handle button area clicks
         event.accept()
         super().mousePressEvent(event)
-    
+
     def mouseMoveEvent(self, event):
-        # Stop event propagation
         event.accept()
         super().mouseMoveEvent(event)
-    
+
     def mouseReleaseEvent(self, event):
-        # Stop event propagation
         event.accept()
         super().mouseReleaseEvent(event)
 
     def toggle_maximized(self):
-        """Maximize when floating; when maximized, restore to centered window (not fullscreen)."""
         mw = self.main_window
-
         if mw.isMaximized():
             def _restore_centered():
                 mw.setWindowState(Qt.WindowState.WindowNoState)
@@ -665,13 +663,11 @@ class BeeWindowControls(QtWidgets.QWidget):
                 x = screen.x() + (screen.width() - w) // 2
                 y = screen.y() + (screen.height() - h) // 2
                 mw.setGeometry(x, y, w, h)
-
             QtCore.QTimer.singleShot(0, _restore_centered)
         else:
             mw.showMaximized()
 
     def toggle_minimize(self):
-        """Minimize window to taskbar."""
         self.main_window.showMinimized()
 
     def _on_window_state_changed(self):
@@ -680,7 +676,6 @@ class BeeWindowControls(QtWidgets.QWidget):
     def on_pin_clicked(self):
         from threecolref.actions.actions import bee_actions
         action = bee_actions['always_on_top'].qaction
-        # Toggle the main action, which will in turn call update_states
         action.trigger()
 
     def update_states(self):
@@ -719,18 +714,16 @@ class SampleColorWidget(QtWidgets.QWidget):
         self.repaint()
 
 
-class ExportImagesFileExistsDialog(QtWidgets.QDialog):
+class ExportImagesFileExistsDialog(ios_dialogs._IosDialogBase):
 
     def __init__(self, parent, filename):
-        super().__init__(parent)
-        self.setWindowTitle('File exists')
-
-        layout = QtWidgets.QVBoxLayout()
-        self.setLayout(layout)
+        super().__init__(parent, 'File exists')
 
         label = QtWidgets.QLabel(
-            f'File already exists:\n{filename}')
-        layout.addWidget(label)
+            f'File already exists:\n{filename}', self.container)
+        label.setStyleSheet("color: white;")
+        self.content_layout.addWidget(label)
+        self.content_layout.addSpacing(10)
 
         choices = (('skip', 'Skip this file'),
                    ('skip_all', 'Skip all existing files'),
@@ -738,76 +731,79 @@ class ExportImagesFileExistsDialog(QtWidgets.QDialog):
                    ('overwrite_all', 'Overwrite all existing files'))
 
         self.radio_buttons = {}
-        for (value, label) in choices:
-            btn = QtWidgets.QRadioButton(label)
+        for (value, text) in choices:
+            btn = QtWidgets.QRadioButton(text, self.container)
+            btn.setStyleSheet("color: white;")
             self.radio_buttons[value] = btn
-            layout.addWidget(btn)
+            self.content_layout.addWidget(btn)
         self.radio_buttons['skip'].setChecked(True)
+        self.content_layout.addSpacing(15)
 
         # Bottom row of buttons
-        buttons = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.StandardButton.Ok
-            | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
-        buttons.rejected.connect(self.reject)
-        buttons.accepted.connect(self.accept)
-        layout.addWidget(buttons)
+        self.cancel_btn = self._create_button("Cancel")
+        self.cancel_btn.clicked.connect(self.reject)
+        
+        sep = QtWidgets.QFrame()
+        sep.setFixedWidth(1)
+        sep.setStyleSheet("background-color: rgba(255, 255, 255, 0.1); border: none;")
+        
+        self.ok_btn = self._create_button("OK", is_primary=True)
+        self.ok_btn.clicked.connect(self.accept)
+
+        self.button_layout.addWidget(self.cancel_btn)
+        self.button_layout.addWidget(sep)
+        self.button_layout.addWidget(self.ok_btn)
 
 
-class UnsavedChangesDialog(QtWidgets.QDialog):
+class UnsavedChangesDialog(ios_dialogs._IosDialogBase):
     """Custom dialog for unsaved changes with 'Remember my choice' option."""
     def __init__(self, parent):
-        super().__init__(parent)
-        self.setWindowTitle("Discard unsaved changes?")
-        self.setWindowModality(Qt.WindowModality.WindowModal)
+        super().__init__(parent, "Discard unsaved changes?")
         self.setMinimumWidth(400)
 
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setSpacing(20)
-        layout.setContentsMargins(20, 20, 20, 20)
-
         # Message
-        self.label = QtWidgets.QLabel("You have unsaved changes. Would you like to save them before exiting?")
+        self.label = QtWidgets.QLabel("You have unsaved changes. Would you like to save them before exiting?", self.container)
         self.label.setWordWrap(True)
-        self.label.setStyleSheet("font-size: 13px;")
-        layout.addWidget(self.label)
+        self.label.setStyleSheet("font-size: 13px; color: rgba(255, 255, 255, 0.8);")
+        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.content_layout.addWidget(self.label)
+        self.content_layout.addSpacing(10)
 
         # Checkbox for "Remember my choice"
-        self.remember_checkbox = QtWidgets.QCheckBox("Remember my choice")
+        self.remember_checkbox = QtWidgets.QCheckBox("Remember my choice", self.container)
         self.remember_checkbox.setToolTip("If checked, this choice will be applied automatically in the future.")
-        layout.addWidget(self.remember_checkbox)
+        self.remember_checkbox.setStyleSheet("color: white;")
+        
+        chk_layout = QtWidgets.QHBoxLayout()
+        chk_layout.addStretch()
+        chk_layout.addWidget(self.remember_checkbox)
+        chk_layout.addStretch()
+        self.content_layout.addLayout(chk_layout)
+        self.content_layout.addSpacing(10)
 
         # Buttons
-        button_layout = QtWidgets.QHBoxLayout()
-        button_layout.setSpacing(10)
-        
-        from threecolref.utils import qcolor_to_hex
-        
-        self.save_btn = QtWidgets.QPushButton("Save")
-        self.save_btn.setMinimumHeight(32)
-        active_color = constants.COLORS['Active:Button']
-        self.save_btn.setStyleSheet(f"background-color: rgb({active_color[0]}, {active_color[1]}, {active_color[2]}); color: white; font-weight: bold; padding: 0 15px;")
-        
-        self.discard_btn = QtWidgets.QPushButton("Discard")
-        self.discard_btn.setMinimumHeight(32)
-        self.discard_btn.setStyleSheet("padding: 0 15px;")
-        
-        self.cancel_btn = QtWidgets.QPushButton("Cancel")
-        self.cancel_btn.setMinimumHeight(32)
-        self.cancel_btn.setStyleSheet("padding: 0 15px;")
-
-        button_layout.addStretch()
-        button_layout.addWidget(self.save_btn)
-        button_layout.addWidget(self.discard_btn)
-        button_layout.addWidget(self.cancel_btn)
-        layout.addLayout(button_layout)
-
-        # Connect buttons
-        self.save_btn.clicked.connect(lambda: self.done(QtWidgets.QMessageBox.StandardButton.Save.value))
-        self.discard_btn.clicked.connect(lambda: self.done(QtWidgets.QMessageBox.StandardButton.Discard.value))
+        self.cancel_btn = self._create_button("Cancel")
         self.cancel_btn.clicked.connect(lambda: self.done(QtWidgets.QMessageBox.StandardButton.Cancel.value))
+        
+        sep1 = QtWidgets.QFrame()
+        sep1.setFixedWidth(1)
+        sep1.setStyleSheet("background-color: rgba(255, 255, 255, 0.1); border: none;")
+        
+        self.discard_btn = self._create_button("Discard", is_destructive=True)
+        self.discard_btn.clicked.connect(lambda: self.done(QtWidgets.QMessageBox.StandardButton.Discard.value))
+        
+        sep2 = QtWidgets.QFrame()
+        sep2.setFixedWidth(1)
+        sep2.setStyleSheet("background-color: rgba(255, 255, 255, 0.1); border: none;")
 
-        # Default button
-        self.save_btn.setDefault(True)
+        self.save_btn = self._create_button("Save", is_primary=True)
+        self.save_btn.clicked.connect(lambda: self.done(QtWidgets.QMessageBox.StandardButton.Save.value))
+
+        self.button_layout.addWidget(self.cancel_btn)
+        self.button_layout.addWidget(sep1)
+        self.button_layout.addWidget(self.discard_btn)
+        self.button_layout.addWidget(sep2)
+        self.button_layout.addWidget(self.save_btn)
 
     def get_result(self):
         """Returns (choice_string, remember_boolean)"""

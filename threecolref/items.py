@@ -20,6 +20,7 @@ text).
 from collections import defaultdict
 from functools import cached_property
 import logging
+import math
 import os.path
 
 from PyQt6 import QtCore, QtGui, QtWidgets
@@ -31,7 +32,7 @@ from PyQt6.QtMultimediaWidgets import QGraphicsVideoItem
 from threecolref import commands
 from threecolref.config import BeeSettings
 from threecolref.constants import COLORS
-from threecolref.selection import SelectableMixin
+from threecolref.selection import SelectableMixin, with_anchor
 
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,15 @@ def sort_by_filename(items):
 
 class BeeItemMixin(SelectableMixin):
     """Base for all items added by the user."""
+
+    collab_id: str | None = None  # Set when collaboration is active
+
+    def ensure_collab_id(self):
+        """Assign a unique collaboration ID if not already set."""
+        if self.collab_id is None:
+            import uuid
+            self.collab_id = uuid.uuid4().hex[:10]
+        return self.collab_id
 
     def set_pos_center(self, pos):
         """Sets the position using the item's center as the origin point."""
@@ -213,10 +223,12 @@ class BeePixmapItem(BeeItemMixin, QtWidgets.QGraphicsPixmapItem):
             return color
 
     def bounding_rect_unselected(self):
-        if self.crop_mode:
-            return QtWidgets.QGraphicsPixmapItem.boundingRect(self)
-        else:
+        """Returns the base pixmap rectangle or crop rectangle directly, bypassing virtual dispatch."""
+        if self.crop:
             return self.crop
+        # Avoid calling self.pixmap() if possible to be faster, but self.pixmap() is safe here.
+        # QtWidgets.QGraphicsPixmapItem.boundingRect(self) is what triggers the virtual loop.
+        return QtCore.QRectF(self.pixmap().rect())
 
     def get_extra_save_data(self):
         return {'filename': self.filename,
@@ -643,9 +655,8 @@ class BeeTextItem(BeeItemMixin, QtWidgets.QGraphicsTextItem):
     TYPE = 'text'
 
     def __init__(self, text=None, html=None, **kwargs):
-        super().__init__()
+        QtWidgets.QGraphicsTextItem.__init__(self)
         self.save_id = None
-        logger.debug(f'Initialized {self}')
         self.is_image = False
         self.init_selectable()
         self.is_editable = True
@@ -670,15 +681,15 @@ class BeeTextItem(BeeItemMixin, QtWidgets.QGraphicsTextItem):
     def get_extra_save_data(self):
         return {'text': self.toPlainText(), 'html': self.toHtml()}
 
-    def contains(self, point):
-        return self.boundingRect().contains(point)
+    def bounding_rect_unselected(self):
+        """Returns the text document's bounding rectangle."""
+        return QtCore.QRectF(QtCore.QPointF(0, 0), self.document().size())
 
     def paint(self, painter, option, widget):
         painter.setPen(Qt.PenStyle.NoPen)
-        color = QtGui.QColor(0, 0, 0)
-        color.setAlpha(40)
-        brush = QtGui.QBrush(color)
-        painter.setBrush(brush)
+        color = QtGui.QColor(0, 0, 0, 40)
+        painter.setBrush(QtGui.QBrush(color))
+        # Use QGraphicsTextItem.boundingRect(self) to avoid recursion
         painter.drawRect(QtWidgets.QGraphicsTextItem.boundingRect(self))
         option.state = QtWidgets.QStyle.StateFlag.State_Enabled
         super().paint(painter, option, widget)
@@ -705,6 +716,20 @@ class BeeTextItem(BeeItemMixin, QtWidgets.QGraphicsTextItem):
         view = self.scene().views()[0] if self.scene().views() else None
         if view and hasattr(view, '_text_toolbar'):
             view._text_toolbar.show_for_item(self)
+        # Connect live text sync
+        self.document().contentsChanged.connect(self._on_text_contents_changed)
+
+    def _on_text_contents_changed(self):
+        """Broadcast text changes to collab peers in real-time."""
+        scene = self.scene()
+        if not scene:
+            return
+        mgr = scene._get_collab_manager() if hasattr(scene, '_get_collab_manager') else None
+        if mgr and not mgr.applying_remote and mgr.is_active:
+            iid = self.ensure_collab_id() if hasattr(self, 'ensure_collab_id') else None
+            if iid:
+                mgr.broadcast_item_transformed(
+                    [iid], 'text_changed', text=self.toPlainText())
 
     def exit_edit_mode(self, commit=True):
         logger.debug(f'Exiting edit mode on {self}')
@@ -780,8 +805,9 @@ class BeeErrorItem(BeeItemMixin, QtWidgets.QGraphicsTextItem):
         txt = self.toPlainText()[:40]
         return (f'Error "{txt}"')
 
-    def contains(self, point):
-        return self.boundingRect().contains(point)
+    def bounding_rect_unselected(self):
+        """Returns the text document's bounding rectangle."""
+        return QtCore.QRectF(QtCore.QPointF(0, 0), self.document().size())
 
     def paint(self, painter, option, widget):
         painter.setPen(Qt.PenStyle.NoPen)
@@ -1164,14 +1190,23 @@ class BeeVideoItem(BeeItemMixin, QtWidgets.QGraphicsPixmapItem):
     def _update_pixmap(self, qimg):
         self.setPixmap(QtGui.QPixmap.fromImage(qimg))
 
+    def paint(self, painter, option, widget):
+        super().paint(painter, option, widget)
+        self.paint_selectable(painter, option, widget)
     @classmethod
     def create_from_data(cls, **kwargs):
+        if 'item' in kwargs:
+            return kwargs.pop('item')
         data = kwargs.get('data', {})
         item = cls(**data)
         return item
 
     def __str__(self):
         return f'Video "{self.filename}"'
+
+    def bounding_rect_unselected(self):
+        """Returns the base pixmap rectangle."""
+        return QtCore.QRectF(self.pixmap().rect())
 
     def get_extra_save_data(self):
         return {'filename': self.filename}
@@ -1198,12 +1233,226 @@ class BeeVideoItem(BeeItemMixin, QtWidgets.QGraphicsPixmapItem):
         base = os.path.splitext(os.path.basename(self.filename))[0]
         return f'videos/{base}{ext}'
     
+
+@register_item
+class BeeDoodleItem(BeeItemMixin, QtWidgets.QGraphicsPathItem):
+    """Class for freehand drawings."""
+
+    TYPE = 'doodle'
+
+    def __init__(self, color_hex='#FF0000', width=2, **kwargs):
+        super().__init__()
+        self.save_id = None
+        self._color_hex = color_hex
+        self._width = width
+        self._points = []
+        self._build_path = QtGui.QPainterPath()
+        
+        pen = QtGui.QPen(QtGui.QColor(color_hex))
+        pen.setWidth(width)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        self.setPen(pen)
+        
+        self.is_image = False
+        self._drawing_session = False
+        self._cached_bounding_rect = None
+        self.init_selectable()
+        logger.debug(f'Initialized {self}')
+
+    @classmethod
+    def create_from_data(cls, **kwargs):
+        data = kwargs.get('data', {})
+        points = data.get('points', [])
+        color = data.get('color', '#FF0000')
+        width = data.get('width', 2)
+        
+        item = cls(color_hex=color, width=width)
+        
+        # Performance: Use QPolygonF for mass-loading points.
+        # This is ~100x faster than a Python loop of lineTo.
+        if points:
+            # Point Decimation on Load (keep complexity in check)
+            if len(points) > 500:
+                points = [points[0]] + points[1:-1:2] + [points[-1]]
+                
+            poly = QtGui.QPolygonF([QtCore.QPointF(*pt) for pt in points])
+            path = QtGui.QPainterPath()
+            path.addPolygon(poly)
+            item._points = points
+            item.setPath(path)
+            # Seed _build_path so undo works correctly
+            item._build_path = path
+
+        return item
+
+    def add_point(self, x, y):
+        """Add a point with O(1) complexity (incremental update)."""
+        point = QtCore.QPointF(x, y)
+        
+        # 1. Distance filter (Figma-style)
+        if self._points:
+            last_x, last_y = self._points[-1]
+            dist_sq = (x - last_x)**2 + (y - last_y)**2
+            if dist_sq < 9:  # 3px threshold
+                return
+
+        prev_pt = QtCore.QPointF(*self._points[-1]) if self._points else point
+        self._points.append((x, y))
+        self._drawing_session = True
+        
+        # 2. Build path incrementally
+        if self._build_path.elementCount() == 0:
+            self._build_path.moveTo(point)
+            update_rect = QtCore.QRectF(point, point)
+        else:
+            mid_pt = (prev_pt + point) / 2
+            self._build_path.quadTo(prev_pt, mid_pt)
+            # Only update the area around the new segment + pen width
+            update_rect = QtCore.QRectF(prev_pt, point).normalized()
+        
+        # 3. Buffer rect for redraw
+        margin = self._width + 5
+        full_update_rect = update_rect.marginsAdded(QtCore.QMarginsF(margin, margin, margin, margin))
+        
+        # 4. DYNAMIC GROWTH: Check if we need to expand the item's scene bounds
+        if self._cached_bounding_rect is not None:
+            if not self._cached_bounding_rect.contains(point):
+                # We've drawn outside the current known box. Tell the scene to expand.
+                # Adding a padding margin (50px) to avoid calling this too often.
+                self.prepareGeometryChange()
+                self._cached_bounding_rect = None # Force recalc in bounding_rect_unselected
+        
+        self.update(full_update_rect)
+        # Calling update() is fine here as it's scoped to the item's redraw
+
+    def finish_path(self):
+        """Commit the path to Qt's scene index (call on mouse release)."""
+        self._drawing_session = False
+        self._cached_bounding_rect = None
+        
+        # 1. Final segment
+        if len(self._points) > 1:
+            last_pt = QtCore.QPointF(*self._points[-1])
+            self._build_path.lineTo(last_pt)
+
+        # 2. Path Simplification (Radial distance)
+        # Keeps complexity down for long-term scene performance
+        if len(self._points) > 50:
+            simplified_path = QtGui.QPainterPath()
+            simplified_path.moveTo(QtCore.QPointF(*self._points[0]))
+            last_p = self._points[0]
+            for i in range(1, len(self._points) - 1):
+                p = self._points[i]
+                # If point is > 4px from last kept point, keep it
+                if (p[0]-last_p[0])**2 + (p[1]-last_p[1])**2 > 16:
+                    simplified_path.lineTo(QtCore.QPointF(*p))
+                    last_p = p
+            simplified_path.lineTo(QtCore.QPointF(*self._points[-1]))
+            self._build_path = simplified_path
+
+        # 3. Commit to C++ scene index
+        self.prepareGeometryChange()
+        self.setPath(self._build_path)
+        
+        # Restore interaction flags
+        self.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
+        self.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        self.update()
+
+    def bounding_rect_unselected(self):
+        """Returns the path's bounding rect using raw _build_path data to bypass virtual recursion."""
+        if getattr(self, '_drawing_session', False) and getattr(self, '_cached_bounding_rect', None):
+            return self._cached_bounding_rect
+            
+        # BYPASS C++ VIRTUAL DISPATCH: Use raw path data directly.
+        # This is mathematically recursion-proof.
+        rect = self._build_path.boundingRect()
+        
+        # SESSION GROWTH: During drawing, ensure we have a growth buffer.
+        if getattr(self, '_drawing_session', False):
+            # Union with current build path just in case
+            rect = rect.united(self._build_path.boundingRect())
+            # Add a growth buffer (50px)
+            rect = rect.marginsAdded(QtCore.QMarginsF(50, 50, 50, 50))
+        
+        # ZOOM STABILITY: Add a safety margin (20px).
+        margin = 20.0
+        rect = rect.marginsAdded(QtCore.QMarginsF(margin, margin, margin, margin))
+        
+        if getattr(self, '_drawing_session', False):
+            self._cached_bounding_rect = rect
+            return self._cached_bounding_rect
+        return rect
+
+    def shape(self):
+        """Returns a fast bounding box during drawing, and the real path otherwise."""
+        if getattr(self, '_drawing_session', False):
+            # Fast-path: don't do complex hit testing while drawing
+            path = QtGui.QPainterPath()
+            path.addRect(self.bounding_rect_unselected())
+            return path
+        return super().shape()
+
+    def __str__(self):
+        return f'Doodle ({len(self._points)} points)'
+
+    def get_extra_save_data(self):
+        return {
+            'points': self._points,
+            'color': self._color_hex,
+            'width': self._width
+        }
+
     def paint(self, painter, option, widget):
-        super().paint(painter, option, widget)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        
+        if getattr(self, '_drawing_session', False):
+            # Optimization: During drawing, paint the raw build_path 
+            # instead of letting QGraphicsPathItem paint its indexed copy.
+            painter.setPen(self.pen())
+            painter.drawPath(self._build_path)
+        else:
+            super().paint(painter, option, widget)
+            
         self.paint_selectable(painter, option, widget)
 
+    def update_from_data(self, **kwargs):
+        """Update doodle properties in real-time."""
+        super().update_from_data(**kwargs)
+        
+        # Geometry update
+        if 'points' in kwargs:
+            points = kwargs['points']
+            if points:
+                # Point Decimation on Load (keep complexity in check)
+                if len(points) > 500:
+                    points = [points[0]] + points[1:-1:2] + [points[-1]]
+                    
+                poly = QtGui.QPolygonF([QtCore.QPointF(*pt) for pt in points])
+                path = QtGui.QPainterPath()
+                path.addPolygon(poly)
+                self._points = points
+                self.setPath(path)
+                self._build_path = path
+
+        # Style updates
+        if 'color' in kwargs:
+            self._color_hex = kwargs['color']
+            pen = self.pen()
+            pen.setColor(QtGui.QColor(self._color_hex))
+            self.setPen(pen)
+        
+        if 'width' in kwargs:
+            self._width = kwargs['width']
+            pen = self.pen()
+            pen.setWidth(self._width)
+            self.setPen(pen)
+
     def create_copy(self):
-        item = BeeVideoItem(self.filename)
+        item = BeeDoodleItem(self._color_hex, self._width)
+        item.setPath(self.path())
+        item._points = list(self._points)
         item.setPos(self.pos())
         item.setZValue(self.zValue())
         item.setScale(self.scale())
@@ -1212,3 +1461,175 @@ class BeeVideoItem(BeeItemMixin, QtWidgets.QGraphicsPixmapItem):
             item.do_flip()
         return item
 
+@register_item
+class BeeShapeItem(BeeItemMixin, QtWidgets.QGraphicsPathItem):
+    """Class for geometric shapes (Rectangle, Ellipse, Line, Arrow)."""
+
+    TYPE = 'shape'
+
+    def __init__(self, shape_type='rect', color_hex='#FF0000', width=2, p1=None, p2=None, **kwargs):
+        super().__init__()
+        self.save_id = None
+        self.shape_type = shape_type
+        self._color_hex = color_hex
+        self._width = width
+        self._p1 = p1 or QtCore.QPointF(0, 0)
+        self._p2 = p2 or QtCore.QPointF(0, 0)
+        
+        pen = QtGui.QPen(QtGui.QColor(color_hex))
+        pen.setWidth(width)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        self.setPen(pen)
+        
+        self.is_image = False
+        self._drawing_session = False
+        self.init_selectable()
+        self._update_path()
+        logger.debug(f'Initialized {self}')
+
+    @classmethod
+    def create_from_data(cls, **kwargs):
+        data = kwargs.get('data', {})
+        shape_type = data.get('shape_type', 'rect')
+        color = data.get('color', '#FF0000')
+        width = data.get('width', 2)
+        p1 = QtCore.QPointF(*data.get('p1', [0, 0]))
+        p2 = QtCore.QPointF(*data.get('p2', [0, 0]))
+        
+        item = cls(shape_type=shape_type, color_hex=color, width=width, p1=p1, p2=p2)
+        return item
+
+    def update_points(self, p1, p2):
+        """Update the control points of the shape."""
+        self._p1 = p1
+        self._p2 = p2
+        self._update_path()
+
+    def _update_path(self):
+        """Rebuild the path based on points and shape type."""
+        path = QtGui.QPainterPath()
+        rect = QtCore.QRectF(self._p1, self._p2).normalized()
+        
+        if self.shape_type == 'rect':
+            path.addRect(rect)
+        elif self.shape_type == 'circle':
+            path.addEllipse(rect)
+        elif self.shape_type == 'line':
+            path.moveTo(self._p1)
+            path.lineTo(self._p2)
+        elif self.shape_type == 'arrow':
+            # Main line
+            path.moveTo(self._p1)
+            path.lineTo(self._p2)
+            
+            # Arrow head
+            line = QtCore.QLineF(self._p1, self._p2)
+            if line.length() > 0:
+                angle = math.atan2(-line.dy(), line.dx())
+                arrow_size = max(10, self._width * 3)
+                
+                p3 = self._p2 - QtCore.QPointF(math.cos(angle + math.pi / 6) * arrow_size,
+                                             -math.sin(angle + math.pi / 6) * arrow_size)
+                p4 = self._p2 - QtCore.QPointF(math.cos(angle - math.pi / 6) * arrow_size,
+                                             -math.sin(angle - math.pi / 6) * arrow_size)
+                
+                path.moveTo(self._p2)
+                path.lineTo(p3)
+                path.moveTo(self._p2)
+                path.lineTo(p4)
+        
+        self.prepareGeometryChange()
+        self.setPath(path)
+
+    def bounding_rect_unselected(self):
+        """Returns the path's bounding rect with a safety margin."""
+        rect = self.path().boundingRect()
+        margin = self._width + 10.0
+        return rect.marginsAdded(QtCore.QMarginsF(margin, margin, margin, margin))
+
+
+    def __str__(self):
+        return f'Shape:{self.shape_type}'
+
+    def get_extra_save_data(self):
+        return {
+            'shape_type': self.shape_type,
+            'color': self._color_hex,
+            'width': self._width,
+            'p1': [self._p1.x(), self._p1.y()],
+            'p2': [self._p2.x(), self._p2.y()]
+        }
+
+    def paint(self, painter, option, widget):
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        super().paint(painter, option, widget)
+        self.paint_selectable(painter, option, widget)
+
+    def update_from_data(self, **kwargs):
+        """Update shape geometry in real-time."""
+        super().update_from_data(**kwargs)
+        
+        # Geometry updates (P1, P2)
+        if 'p1' in kwargs:
+            self._p1 = QtCore.QPointF(*kwargs['p1'])
+        if 'p2' in kwargs:
+            self._p2 = QtCore.QPointF(*kwargs['p2'])
+            
+        if 'p1' in kwargs or 'p2' in kwargs:
+            self._update_path()
+
+        # Style updates
+        if 'color' in kwargs:
+            self._color_hex = kwargs['color']
+            pen = self.pen()
+            pen.setColor(QtGui.QColor(self._color_hex))
+            self.setPen(pen)
+        
+        if 'width' in kwargs:
+            self._width = kwargs['width']
+            pen = self.pen()
+            pen.setWidth(self._width)
+            self.setPen(pen)
+
+    @with_anchor
+    def setScale(self, value):
+        if self.shape_type in ('line', 'arrow'):
+            # UX UPGRADE: Point-based scaling for lines/arrows
+            # This keeps arrowheads at constant size even when lines are long.
+            if not hasattr(self, '_orig_points_for_scale'):
+                self._orig_points_for_scale = (self._p1, self._p2)
+                self._orig_scale_at_start = self.scale()
+
+            p1_orig, p2_orig = self._orig_points_for_scale
+            # The 'value' from SelectableMixin is (scale_at_press * relative_factor)
+            # We want to keep the item's coordinate scale at its original value (usually 1.0)
+            # and instead transform the points directly.
+            relative_factor = value / self._orig_scale_at_start
+            
+            # Since with_anchor is used, the anchor point is fixed in scene space.
+            # We just scale the points relative to the local (0,0) or some reference.
+            # Actually, standard scaling around anchor (0,0) in local space is:
+            self._p1 = p1_orig * relative_factor
+            self._p2 = p2_orig * relative_factor
+            self._update_path()
+            # Do NOT call super().setScale(value) to avoid coordinate system scaling
+            return
+
+        super().setScale(value)
+
+    def mousePressEvent(self, event):
+        # Clear the original points cache when a new interaction starts
+        if hasattr(self, '_orig_points_for_scale'):
+            del self._orig_points_for_scale
+        super().mousePressEvent(event)
+
+    def create_copy(self):
+        item = BeeShapeItem(self.shape_type, self._color_hex, self._width, self._p1, self._p2)
+        item.setPos(self.pos())
+        item.setZValue(self.zValue())
+        item.setScale(self.scale())
+        item.setRotation(self.rotation())
+        if self.flip() == -1:
+            item.do_flip()
+        return item

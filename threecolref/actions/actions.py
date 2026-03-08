@@ -142,6 +142,13 @@ bee_actions = ActionList([
         group='active_when_items_in_scene',
     ),
     Action(
+        id='copy_scene_image',
+        text='&Copy Scene as Image',
+        shortcuts=['Ctrl+Shift+C'],
+        callback='on_action_copy_scene_image',
+        group='active_when_items_in_scene',
+    ),
+    Action(
         id='export_images',
         text='Export &Images...',
         callback='on_action_export_images',
@@ -476,5 +483,22 @@ bee_actions = ActionList([
         settings='autosave_enabled',
         checked=False,
         callback='on_action_toggle_autosave',
+    ),
+    Action(
+        id='share_session',
+        text='&Share Session',
+        shortcuts=['Ctrl+Shift+L'],
+        callback='on_action_share_session',
+    ),
+    Action(
+        id='join_session',
+        text='&Join Session',
+        shortcuts=['Ctrl+Shift+J'],
+        callback='on_action_join_session',
+    ),
+    Action(
+        id='stop_collaboration',
+        text='S&top Collaboration',
+        callback='on_action_stop_collaboration',
     ),
 ])

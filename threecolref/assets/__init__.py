@@ -63,6 +63,20 @@ class BeeAssets:
         self.icon_restore = str(self.PATH.joinpath('icon_restore.svg'))
         self.icon_gear = str(self.PATH.joinpath('icon_gear.svg'))
 
+        # Doodle Toolbar icons (iOS/Lucide style)
+        self.icon_pencil = str(self.PATH.joinpath('icon_pencil.svg'))
+        self.icon_eraser = str(self.PATH.joinpath('icon_eraser.svg'))
+        self.icon_undo = str(self.PATH.joinpath('icon_undo.svg'))
+        self.icon_redo = str(self.PATH.joinpath('icon_redo.svg'))
+        self.icon_trash = str(self.PATH.joinpath('icon_trash.svg'))
+        self.icon_close = str(self.PATH.joinpath('icon_close.svg'))
+        self.icon_grip = str(self.PATH.joinpath('icon_grip.svg'))
+        self.icon_rect = str(self.PATH.joinpath('icon_rect.svg'))
+        self.icon_circle = str(self.PATH.joinpath('icon_circle.svg'))
+        self.icon_line = str(self.PATH.joinpath('icon_line.svg'))
+        self.icon_arrow = str(self.PATH.joinpath('icon_arrow.svg'))
+        self.icon_select = str(self.PATH.joinpath('icon_select.svg'))
+
     def cursor_from_image(self, filename, hotspot):
         app = QtWidgets.QApplication.instance()
         scaling = app.primaryScreen().devicePixelRatio()

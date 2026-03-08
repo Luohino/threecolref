@@ -24,6 +24,8 @@ from PyQt6.QtCore import Qt
 from threecolref.actions import ActionsMixin
 from threecolref.actions.actions import bee_actions
 from threecolref import commands
+from threecolref.collaboration import protocol
+from threecolref.collaboration.manager import CollaborationManager
 from threecolref.config import CommandlineArgs, BeeSettings, KeyboardSettings
 from threecolref import constants
 from threecolref import fileio
@@ -57,6 +59,9 @@ class BeeGraphicsView(MainControlsMixin,
 
         self.setBackgroundBrush(
             QtGui.QBrush(QtGui.QColor(*constants.COLORS['Scene:Canvas'])))
+        
+        # Enables mouseMoveEvent to fire even when no button is pressed
+        self.setMouseTracking(True)
         self.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
         self.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
 
@@ -80,6 +85,12 @@ class BeeGraphicsView(MainControlsMixin,
         self.previous_transform = None
         self.active_mode = None
 
+        # Debounce timer for expensive scene rect recalculation
+        self._recalc_timer = QtCore.QTimer(self)
+        self._recalc_timer.setSingleShot(True)
+        self._recalc_timer.setInterval(50)
+        self._recalc_timer.timeout.connect(self.recalc_scene_rect)
+
         self.scene = BeeGraphicsScene(self.undo_stack)
         self.scene.changed.connect(self.on_scene_changed)
         self.scene.selectionChanged.connect(self.on_selection_changed)
@@ -87,18 +98,38 @@ class BeeGraphicsView(MainControlsMixin,
         self.scene.cursor_cleared.connect(self.on_cursor_cleared)
         self.setScene(self.scene)
 
+        # Install event filter on viewport so we can reset the cursor when
+        # the mouse re-enters the canvas after an OS window resize operation.
+        self.viewport().installEventFilter(self)
+
         from threecolref.widgets.welcome_overlay import WelcomeOverlay
-        self.welcome_overlay = WelcomeOverlay(self)
+        self.welcome_overlay = WelcomeOverlay(self, view=self)
         self._hierarchy_overlay = None
 
         from threecolref.widgets.text_toolbar import TextFormatToolbar
         self._text_toolbar = TextFormatToolbar(self)
+        self._doodle_toolbar = None
 
         # Context menu and actions
         self.build_menu_and_actions()
         self.control_target = self
         self.init_main_controls(main_window=parent)
         self.init_watermark()
+
+        # Collaboration
+        self.collab = CollaborationManager(parent=self)
+
+        from threecolref.collaboration.cursor_overlay import RemoteCursorOverlay
+        self.cursor_overlay = RemoteCursorOverlay(self)
+        from threecolref.collaboration.status_widget import CollaborationStatusWidget
+        self.collab_status = CollaborationStatusWidget(self)
+        self._setup_collab_signals()
+
+        # Phase 2: High-Capacity Batching
+        self._remote_item_queue = []
+        self._sync_timer = QtCore.QTimer(self)
+        self._sync_timer.setInterval(1)  # High frequency but yields to UI
+        self._sync_timer.timeout.connect(self._process_remote_queue)
 
         # Load files given via command line
         if commandline_args.filenames:
@@ -109,6 +140,7 @@ class BeeGraphicsView(MainControlsMixin,
                 self.do_insert_images(commandline_args.filenames)
 
         self.update_window_title()
+        self._is_joining = False
 
     @property
     def hierarchy_overlay(self):
@@ -129,6 +161,87 @@ class BeeGraphicsView(MainControlsMixin,
         if value:
             self.settings.update_recent_files(value)
             self.update_menu_and_actions()
+
+    @property
+    def doodle_toolbar(self):
+        if self._doodle_toolbar is None:
+            from threecolref.widgets.doodle_toolbar import DoodleToolbar
+            self._doodle_toolbar = DoodleToolbar(self)
+            self._doodle_toolbar.tool_changed.connect(self._on_doodle_tool_changed)
+            self._doodle_toolbar.color_changed.connect(self._on_doodle_color_changed)
+            self._doodle_toolbar.width_changed.connect(self._on_doodle_width_changed)
+            self._doodle_toolbar.undo_clicked.connect(self._on_doodle_undo)
+            self._doodle_toolbar.redo_clicked.connect(self._on_doodle_redo)
+            self._doodle_toolbar.clear_clicked.connect(self._on_doodle_clear)
+            self._doodle_toolbar.closed.connect(self._on_doodle_toolbar_closed)
+        return self._doodle_toolbar
+
+    def _on_doodle_tool_changed(self, tool):
+        # Exit movewin mode if active
+        if getattr(self, 'movewin_active', False):
+            self.exit_movewin_mode()
+        
+        width = int(self.settings.valueOrDefault('Items/doodle_width') or 4)
+        if tool == 'select':
+            self.scene.active_mode = None
+            self.viewport().unsetCursor()
+        elif tool == 'eraser':
+            self.scene.active_mode = self.scene.ERASE_MODE
+            cursor = self._create_circular_cursor(width, QtGui.QColor('#FFFFFF'))
+            self.viewport().setCursor(cursor)
+        else:
+            # Pencil or shapes
+            self.scene.active_mode = self.scene.DRAW_MODE
+            self.scene.active_tool = tool
+            self.viewport().setCursor(Qt.CursorShape.CrossCursor)
+
+    def _on_doodle_color_changed(self, color_hex):
+        self.scene.settings.setValue('Items/doodle_color', color_hex)
+
+    def _on_doodle_width_changed(self, width):
+        self.scene.settings.setValue('Items/doodle_width', width)
+        # Update cursor if in eraser mode
+        if self.scene.active_mode == self.scene.ERASE_MODE:
+            self.viewport().setCursor(self._create_circular_cursor(width, QtGui.QColor('#FFFFFF')))
+
+    def _on_doodle_undo(self):
+        self.undo_stack.undo()
+
+    def _on_doodle_redo(self):
+        self.undo_stack.redo()
+
+    def _on_doodle_clear(self):
+        msg = "Are you sure you want to clear all doodles?"
+        if QtWidgets.QMessageBox.question(self, "Clear All", msg) == QtWidgets.QMessageBox.StandardButton.Yes:
+            self.scene.clear_doodles()
+
+    def _create_circular_cursor(self, width, color):
+        """Creates a circular cursor matching the stroke width."""
+        # Scale width based on view zoom if needed, but for UI cursors, 
+        # usually 1:1 screen space is best unless we want to match scene space.
+        # Let's keep it simple: pixel size 12-64
+        size = max(12, min(width, 128))
+        pixmap = QtGui.QPixmap(size + 2, size + 2)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        
+        painter = QtGui.QPainter()
+        if not painter.begin(pixmap):
+            return QtGui.QCursor(Qt.CursorShape.CrossCursor)
+            
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        pen = QtGui.QPen(color, 1)
+        painter.setPen(pen)
+        painter.drawEllipse(1, 1, size, size)
+        painter.end()
+        
+        return QtGui.QCursor(pixmap, size // 2 + 1, size // 2 + 1)
+
+    def _on_doodle_toolbar_closed(self):
+        if self.scene:
+            self.scene.active_mode = None
+        viewport = self.viewport()
+        if viewport and not getattr(self, 'movewin_active', False):
+            viewport.unsetCursor()
 
     def cancel_active_modes(self):
         self.scene.cancel_active_modes()
@@ -155,19 +268,32 @@ class BeeGraphicsView(MainControlsMixin,
             title = f'{name}{clean} - {constants.APPNAME}'
         self.host_window.setWindowTitle(title)
 
+    def _schedule_recalc_scene_rect(self):
+        """Debounced scene rect recalculation — fires once after activity stops."""
+        self._recalc_timer.start()
+
     def on_scene_changed(self, region):
+        if self.scene.active_mode in (self.scene.DRAW_MODE, self.scene.ERASE_MODE):
+            # NO-OP during drawing to save CPU. Geometry updates are handled by the items.
+            return
+
         if not self.scene.items():
             logger.debug('No items in scene')
             self.setTransform(QtGui.QTransform())
             self.welcome_overlay.setFocus()
             self.clearFocus()
+            # Size the overlay to cover the entire view
+            self.welcome_overlay.setGeometry(self.rect())
+            self.welcome_overlay.raise_()
+            self.welcome_overlay.update_visibility()
+            self.welcome_overlay.update()
             self.welcome_overlay.show()
             self.actiongroup_set_enabled('active_when_items_in_scene', False)
         else:
             self.setFocus()
             self.welcome_overlay.hide()
             self.actiongroup_set_enabled('active_when_items_in_scene', True)
-        self.recalc_scene_rect()
+        self._schedule_recalc_scene_rect()
 
 
     def on_can_redo_changed(self, can_redo):
@@ -180,7 +306,26 @@ class BeeGraphicsView(MainControlsMixin,
         self.update_window_title()
 
     def on_context_menu(self, point):
+        self._update_collab_actions()
         self.context_menu.exec(self.mapToGlobal(point))
+
+    def _update_collab_actions(self):
+        """Update collaboration actions visibility/enabled state based on current session."""
+        from threecolref.actions.actions import bee_actions
+        is_active = self.collab.is_active
+        
+        # If active, disable Share and Join, but enable Stop
+        if 'share_session' in bee_actions:
+            bee_actions['share_session'].qaction.setEnabled(not is_active)
+            bee_actions['share_session'].qaction.setVisible(not is_active)
+            
+        if 'join_session' in bee_actions:
+            bee_actions['join_session'].qaction.setEnabled(not is_active)
+            bee_actions['join_session'].qaction.setVisible(not is_active)
+            
+        if 'stop_collaboration' in bee_actions:
+            bee_actions['stop_collaboration'].qaction.setEnabled(is_active)
+            bee_actions['stop_collaboration'].qaction.setVisible(is_active)
 
     def get_supported_image_formats(self, cls):
         formats = []
@@ -574,7 +719,8 @@ class BeeGraphicsView(MainControlsMixin,
         self.progress = widgets.BeeProgressDialog(
             f'Loading {filename}',
             worker=self.worker,
-            parent=self)
+            parent=self,
+            title=constants.APPNAME)
         self.worker.start()
 
     def on_action_open(self):
@@ -644,7 +790,8 @@ class BeeGraphicsView(MainControlsMixin,
         self.progress = widgets.BeeProgressDialog(
             f'Saving {filename}',
             worker=self.worker,
-            parent=self)
+            parent=self,
+            title=constants.APPNAME)
         self.worker.start()
 
     def on_action_save_as(self):
@@ -700,10 +847,33 @@ class BeeGraphicsView(MainControlsMixin,
         self.worker.finished.connect(self.on_export_finished)
         from threecolref import widgets
         self.progress = widgets.BeeProgressDialog(
-            f'Exporting {filename}',
+            f'Exporting scene…',
             worker=self.worker,
-            parent=self)
+            parent=self,
+            title=constants.APPNAME)
         self.worker.start()
+
+    def on_action_copy_scene_image(self):
+        """Render the entire scene and copy it to the system clipboard as an image."""
+        from threecolref.fileio.export import SceneToPixmapExporter
+        try:
+            exporter = SceneToPixmapExporter(self.scene)
+            exporter.size = exporter.default_size
+            image = exporter.render_to_image()
+            pixmap = QtGui.QPixmap.fromImage(image)
+            QtWidgets.QApplication.clipboard().setPixmap(pixmap)
+            logger.info('Scene copied to clipboard')
+            # Brief confirmation toast
+            QtWidgets.QToolTip.showText(
+                QtGui.QCursor.pos(),
+                '📋 Scene copied to clipboard!',
+                None, QtCore.QRect(), 2000)
+        except Exception as e:
+            logger.error(f'Failed to copy scene to clipboard: {e}')
+            QtWidgets.QMessageBox.warning(
+                self, 'Copy Failed',
+                f'Could not copy scene to clipboard:\n{e}')
+
 
     def on_export_finished(self, filename, errors):
         if errors:
@@ -732,9 +902,10 @@ class BeeGraphicsView(MainControlsMixin,
         self.worker.finished.connect(self.on_export_finished)
         from threecolref import widgets
         self.progress = widgets.BeeProgressDialog(
-            f'Exporting to {directory}',
+            f'Exporting images…',
             worker=self.worker,
-            parent=self)
+            parent=self,
+            title=constants.APPNAME)
         self.worker.start()
 
     def on_export_images_file_exists(self, filename):
@@ -744,9 +915,10 @@ class BeeGraphicsView(MainControlsMixin,
             self.exporter.handle_existing = dlg.get_answer()
             directory = self.exporter.dirname
             self.progress = widgets.BeeProgressDialog(
-                f'Exporting to {directory}',
+                f'Exporting images…',
                 worker=self.worker,
-                parent=self)
+                parent=self,
+                title=constants.APPNAME)
             self.worker.start()
 
     def on_action_export_item(self):
@@ -824,14 +996,9 @@ class BeeGraphicsView(MainControlsMixin,
         HelpDialog(self)
 
     def on_action_about(self):
-        QtWidgets.QMessageBox.about(
-            self,
-            f'About {constants.APPNAME}',
-            (f'<h2>{constants.APPNAME} {constants.VERSION}</h2>'
-             f'<p>{constants.APPNAME_FULL}</p>'
-             f'<p>{constants.COPYRIGHT}</p>'
-             f'<p><a href="{constants.WEBSITE}">'
-             f'Visit the {constants.APPNAME} website</a></p>'))
+        from threecolref.widgets import AboutDialog
+        dialog = AboutDialog(self)
+        dialog.exec()
     
     def on_action_toggle_autosave(self, enabled):
         """Toggle autosave on/off."""
@@ -904,6 +1071,552 @@ class BeeGraphicsView(MainControlsMixin,
     def on_action_debuglog(self):
         from threecolref.widgets import DebugLogDialog
         DebugLogDialog(self)
+
+    # ------------------------------------------------------------------
+    # Collaboration actions
+    # ------------------------------------------------------------------
+
+    def _setup_collab_signals(self):
+        """Wire collaboration manager signals to local handlers."""
+        self.collab.remote_item_moved.connect(self._apply_remote_move)
+        self.collab.remote_item_removed.connect(self._apply_remote_remove)
+        self.collab.remote_cursor_moved.connect(self._apply_remote_cursor)
+        self.collab.remote_item_added.connect(self._apply_remote_item_added)
+        self.collab.error_occurred.connect(self._on_collab_error)
+        self.collab.remote_user_left.connect(self._apply_remote_user_left)
+        self.collab.status_changed.connect(self._on_collab_status_changed)
+        self.collab.user_count_changed.connect(self.collab_status.set_user_count)
+        self.collab.remote_full_sync_request.connect(self._on_full_sync_request)
+        self.collab.remote_full_sync_response.connect(self._on_full_sync_response)
+        self.collab.remote_doodle_start.connect(self._apply_remote_doodle_start)
+        self.collab.remote_doodle_point.connect(self._apply_remote_doodle_point)
+        self.collab.remote_doodle_end.connect(self._apply_remote_doodle_end)
+        self.collab.remote_item_transformed.connect(self._apply_remote_transform)
+        self.collab.remote_sync_start.connect(self._apply_remote_sync_start)
+        self.collab.remote_sync_end.connect(self._apply_remote_sync_end)
+
+
+    def on_action_share_session(self):
+        try:
+            code = self.collab.start_cloud_sharing()
+            
+            # CRITICAL: Pre-assign collab_ids to all existing scene items AFTER
+            # starting sharing (because start_sharing() clears the cache).
+            # Items loaded from file have collab_id=None, which
+            # means movement broadcasts send None as item_id and peers can't match them.
+            for item in self.scene.items():
+                if hasattr(item, 'ensure_collab_id'):
+                    cid = item.ensure_collab_id()
+                    self.collab.register_item(cid, item)
+                    
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(
+                self, 'Share Session',
+                f'Could not start sharing: {e}')
+            return
+
+        from threecolref.widgets.ios_dialogs import BeeIosSessionCodeDialog
+        BeeIosSessionCodeDialog.show_session_code(self, code)
+
+    def on_action_join_session(self):
+        if getattr(self, '_is_joining', False):
+            return
+            
+        from threecolref.widgets.ios_dialogs import BeeIosInputDialog
+        code, ok = BeeIosInputDialog.get_text(
+            self, 'Join Session',
+            'Enter session code:')
+        if ok and code.strip():
+            try:
+                logger.info(f'[collab] User initiated join for code: {code.strip()}')
+                self._is_joining = True
+                if hasattr(self, 'welcome_overlay'):
+                    # Prioritize overlay and show loading
+                    self.welcome_overlay.show()
+                    self.welcome_overlay.raise_()
+                    self.welcome_overlay.show_loading('Joining session...')
+                
+                # Proactive local UI state reset
+                self.collab_status.hide()
+                
+                # Start join timeout (20s)
+                if not hasattr(self, '_join_timeout_timer'):
+                    self._join_timeout_timer = QtCore.QTimer(self)
+                    self._join_timeout_timer.setSingleShot(True)
+                    self._join_timeout_timer.timeout.connect(self._on_join_timeout)
+                self._join_timeout_timer.start(20000)
+                
+                self.collab.join_session(code.strip())
+            except Exception as e:
+                logger.error(f'[collab] Failed to start join process: {e}', exc_info=True)
+                self._on_collab_error(str(e))
+
+    def _on_join_timeout(self):
+        if getattr(self, '_is_joining', False):
+            logger.warning('[collab] Join attempt timed out after 20s')
+            self._on_collab_error('Connection timed out. Please check the code or your internet connection.')
+
+    def on_action_stop_collaboration(self):
+        self.collab.stop()
+
+    def _on_collab_error(self, msg):
+        logger.error(f'[collab] Collaboration error received: {msg}')
+        self._is_joining = False
+        if hasattr(self, '_join_timeout_timer'):
+            self._join_timeout_timer.stop()
+            
+        if hasattr(self, 'welcome_overlay'):
+            self.welcome_overlay.hide_loading()
+            self.welcome_overlay.hide()
+            
+        # Clean up partial state
+        self.collab.stop()
+        
+        QtWidgets.QMessageBox.warning(
+            self, 'Collaboration Error', msg)
+
+    # --- Applying remote events ---
+
+    def _collab_item_by_id(self, item_id):
+        """Find a scene item by its collab_id using O(1) manager cache."""
+        return self.collab.get_item(item_id)
+
+    def _apply_remote_transform(self, data):
+        """Apply a remote scale, rotate, or text-change to an item."""
+        logger.debug(f"[collab] Incoming transformation: {data}")
+        item_ids = data.get('item_ids', [])
+        transform_type = data.get('transform_type', '')
+        
+        self.collab.begin_remote_apply()
+        try:
+            for iid in item_ids:
+                item = self._collab_item_by_id(iid)
+                if not item:
+                    continue
+                    
+                if transform_type == 'move':
+                    x, y = data.get('x', item.pos().x()), data.get('y', item.pos().y())
+                    item.setPos(x, y)
+                elif transform_type == 'scale':
+                    s = data.get('scale')
+                    x, y = data.get('x', item.pos().x()), data.get('y', item.pos().y())
+                    if s is not None:
+                        item.setScale(s)
+                        item.setPos(x, y)
+                elif transform_type == 'rotate':
+                    r = data.get('rotation')
+                    x, y = data.get('x', item.pos().x()), data.get('y', item.pos().y())
+                    if r is not None:
+                        item.setRotation(r)
+                        item.setPos(x, y)
+                elif transform_type == 'text_changed':
+                    text = data.get('text', '')
+                    if hasattr(item, 'setPlainText'):
+                        item.document().blockSignals(True)
+                        item.setPlainText(text)
+                        item.document().blockSignals(False)
+            
+            # FIGMA-STYLE UX: Force a repaint and recalculate scene bounds
+            # so the host/peer sees the movement immediately.
+            self.scene.update()
+            if hasattr(self, 'recalc_scene_rect'):
+                self.recalc_scene_rect()
+                
+        finally:
+            self.collab.end_remote_apply()
+
+    def _apply_remote_move(self, data):
+        item_ids = data.get('item_ids', [])
+        dx, dy = data.get('dx', 0), data.get('dy', 0)
+        self.collab.begin_remote_apply()
+        try:
+            for iid in item_ids:
+                item = self._collab_item_by_id(iid)
+                if item:
+                    item.moveBy(dx, dy)
+        finally:
+            self.collab.end_remote_apply()
+
+    def _apply_remote_remove(self, data):
+        item_ids = data.get('item_ids', [])
+        self.collab.begin_remote_apply()
+        try:
+            for iid in item_ids:
+                item = self._collab_item_by_id(iid)
+                if item:
+                    self.scene.removeItem(item)
+                    self.collab.unregister_item(iid)
+        finally:
+            self.collab.end_remote_apply()
+
+    def _apply_remote_item_added(self, data):
+        """Queue a remote item for reconstruction."""
+        self._remote_item_queue.append(data)
+        if not self._sync_timer.isActive():
+            self._sync_timer.start()
+
+    def _process_remote_queue(self):
+        """Process a batch of remote items from the queue."""
+        if not self._remote_item_queue:
+            self._sync_timer.stop()
+            # If we were in a sync, hide the overlay now that processing is done
+            if getattr(self, '_is_receiving_sync', False):
+                self._is_receiving_sync = False
+                self.on_action_fit_scene()
+                if hasattr(self, 'welcome_overlay'):
+                    # Force one last GUI update before hiding
+                    QtWidgets.QApplication.processEvents()
+                    self.welcome_overlay.hide_loading()
+                    self.welcome_overlay.hide()
+                
+                # Reveal the status pill now that the loading screen is gone
+                if self.collab.is_active:
+                    self.collab_status.show()
+                    self.collab_status.update()
+            return
+
+        # Process up to 5 items per batch to keep UI responsive
+        batch_size = 5
+        batch = self._remote_item_queue[:batch_size]
+        self._remote_item_queue = self._remote_item_queue[batch_size:]
+
+        import base64
+        self.collab.begin_remote_apply()
+        try:
+            for data in batch:
+                item_data = data.get('data', {})
+                item_type = data.get('item_type', 'pixmap')
+                item_id = data.get('item_id')
+                parent_id = item_data.get('parent_id')
+
+                try:
+                    # Parenting recovery helper
+                    def restore_parenting(item, pid):
+                        if not pid: return
+                        parent = self._collab_item_by_id(pid)
+                        if parent:
+                            was_blocked = self.collab.applying_remote
+                            # Temporarily block applying_remote to avoid loop during mapFromScene
+                            scene_pos = item.scenePos()
+                            item.setParentItem(parent)
+                            item.setPos(parent.mapFromScene(scene_pos))
+                        else:
+                            logger.debug(f'[collab] Parent {pid} not found yet for item {item_id}')
+
+                    # Check if item already exists to avoid duplicates during real-time sync (like shapes)
+                    existing = self._collab_item_by_id(item_id)
+                    if existing:
+                        if hasattr(existing, 'update_from_data'):
+                            existing.update_from_data(**item_data)
+                        else:
+                            # Fallback if mixin missing
+                            existing.setPos(item_data.get('x', 0), item_data.get('y', 0))
+                            existing.setZValue(item_data.get('z', 0))
+                            existing.setScale(item_data.get('scale', 1))
+                            existing.setRotation(item_data.get('rotation', 0))
+                        
+                        # Ensure parenting matches
+                        if parent_id and (not existing.parentItem() or getattr(existing.parentItem(), 'collab_id', None) != parent_id):
+                            restore_parenting(existing, parent_id)
+                        continue
+
+                    if item_type == 'pixmap':
+                        if 'image_bytes' in item_data:
+                            img_bytes = item_data['image_bytes']
+                        else:
+                            img_bytes = base64.b64decode(item_data.get('image_b64', ''))
+                            
+                        pixmap = QtGui.QPixmap()
+                        pixmap.loadFromData(img_bytes)
+                        if pixmap.isNull():
+                            logger.warning(f'[collab] Failed to load pixmap for item {item_id}')
+                            continue
+                        img = pixmap.toImage()
+                        item = BeePixmapItem(img, item_data.get('filename'))
+                        item.collab_id = item_id
+                        item.update_from_data(**item_data)
+                        self.scene.addItem(item)
+                        self.collab.register_item(item_id, item)
+                    elif item_type == 'text':
+                        item = BeeTextItem()
+                        item.collab_id = item_id
+                        item.update_from_data(**item_data)
+                        self.scene.addItem(item)
+                        self.collab.register_item(item_id, item)
+                    elif item_type == 'doodle':
+                        from threecolref.items import BeeDoodleItem
+                        item = BeeDoodleItem.create_from_data(data=item_data)
+                        item.collab_id = item_id
+                        item.update_from_data(**item_data)
+                        self.scene.addItem(item)
+                        self.collab.register_item(item_id, item)
+                        # REMOVED: item.bring_to_front() (fixes reverse Z-order)
+                    elif item_type == 'shape':
+                        from threecolref.items import BeeShapeItem
+                        item = BeeShapeItem.create_from_data(data=item_data)
+                        item.collab_id = item_id
+                        item.update_from_data(**item_data)
+                        self.scene.addItem(item)
+                        self.collab.register_item(item_id, item)
+                    elif item_type == 'video':
+                        from threecolref.items import BeeVideoItem
+                        item = BeeVideoItem(item_data.get('filename'))
+                        item.collab_id = item_id
+                        # Use received thumbnail indefinitely if probe fails/offline
+                        if 'image_bytes' in item_data:
+                            px = QtGui.QPixmap()
+                            px.loadFromData(item_data['image_bytes'])
+                            if not px.isNull():
+                                item.setPixmap(px)
+                        
+                        item.update_from_data(**item_data)
+                        self.scene.addItem(item)
+                        self.collab.register_item(item_id, item)
+                    
+                    if parent_id and item and not item.parentItem():
+                        restore_parenting(item, parent_id)
+
+                except Exception as e:
+                    logger.error(f'[collab] Critical error reconstructing {item_type} item {item_id}: {e}', exc_info=True)
+
+            # Robust overlay management: Hide welcome overlay if ANY items are added
+            # BUT only if we aren't in a formal SYNC delivery (which handles its own hiding)
+            if not getattr(self, '_is_receiving_sync', False):
+                if hasattr(self, 'welcome_overlay') and self.scene.items():
+                    self.welcome_overlay.hide()
+                    
+        finally:
+            self.collab.end_remote_apply()
+
+        # If queue is now empty and we were in a sync, we might need a fit
+        if not self._remote_item_queue:
+            self.on_action_fit_scene()
+
+
+    def _apply_remote_doodle_start(self, data):
+        """A remote user started drawing."""
+        item_id = data.get('item_id')
+        color = data.get('color', '#FF0000')
+        width = data.get('width', 2)
+        x, y = data.get('x', 0), data.get('y', 0)
+        item_type = data.get('item_type', 'doodle')
+        parent_id = data.get('parent_id')
+
+        self.collab.begin_remote_apply()
+        try:
+            from threecolref.items import BeeDoodleItem, BeeShapeItem
+            if item_type == 'shape':
+                # Reconstruct as shape if sent as such (e.g. from mouseRelease retry or full sync)
+                # But doodle_start msg usually implies real-time stroke.
+                item = BeeShapeItem(shape_type=data.get('shape_type', 'rect'), color_hex=color, width=width)
+            elif item_type in ('rect', 'circle', 'line', 'arrow'):
+                item = BeeShapeItem(shape_type=item_type, color_hex=color, width=width)
+            else:
+                item = BeeDoodleItem(color_hex=color, width=width)
+            
+            item.setPos(x, y)
+            if hasattr(item, 'add_point'):
+                item.add_point(0, 0)
+            item.collab_id = item_id
+            self.scene.addItem(item)
+            self.collab.register_item(item_id, item)
+            
+            if parent_id:
+                parent = self._collab_item_by_id(parent_id)
+                if parent:
+                    # Drawings are relative to parent
+                    item.setParentItem(parent)
+                    item.setPos(x, y) # Doodles are sent in parent local coords if parent exists
+        finally:
+            self.collab.end_remote_apply()
+
+    def _apply_remote_doodle_point(self, data):
+        """A remote user added a point to their drawing."""
+        item_id = data.get('item_id')
+        x, y = data.get('x', 0), data.get('y', 0)
+
+        item = self._collab_item_by_id(item_id)
+        if item and hasattr(item, 'add_point'):
+            self.collab.begin_remote_apply()
+            try:
+                item.add_point(x, y)
+            finally:
+                self.collab.end_remote_apply()
+
+    def _apply_remote_doodle_end(self, data):
+        """A remote user finished drawing a stroke."""
+        pass
+
+    def _apply_remote_cursor(self, data):
+        """Update remote cursor overlay."""
+        self.cursor_overlay.update_cursor(data)
+
+    def _apply_remote_user_left(self, uid):
+        self.cursor_overlay.remove_cursor(uid)
+
+    def _on_collab_status_changed(self, status):
+        logger.debug(f'[collab] Status changed: {status} (is_joining={getattr(self, "_is_joining", False)})')
+        # Bulletproof: Don't show the pill if we are still in a loading state
+        # this prevents the "Connected" pill from popping over the "Joining..." overlay
+        overlay_active = hasattr(self, 'welcome_overlay') and self.welcome_overlay.isVisible()
+        
+        if status != 'disconnected' and (overlay_active or getattr(self, '_is_joining', False)):
+            # Store status but don't show the pill yet
+            self.collab_status._status = status
+            self.collab_status.hide()
+        else:
+            self.collab_status.set_status(status)
+            
+        if status == 'disconnected':
+            self.cursor_overlay.stop()
+            # If we are purposefully joining another session, don't hide the loading overlay
+            if not getattr(self, '_is_joining', False):
+                self.welcome_overlay.hide_loading()
+                # If we were in an active session (session_code set) but didn't
+                # initiate the stop ourselves, the host must have dropped us.
+                # Fully reset state so the pill/code/user-count all clear.
+                if self.collab.session_code:
+                    logger.info('[collab] Host dropped session — fully resetting collaboration state')
+                    QtCore.QTimer.singleShot(100, self.collab.stop)
+        else:
+            self.cursor_overlay.start()
+            # Reset joining flag once we are connected to the new session (or hosting)
+            if status in ('connected', 'hosting'):
+                self._is_joining = False
+                if hasattr(self, '_join_timeout_timer'):
+                    self._join_timeout_timer.stop()
+            # We don't hide_loading on 'connected' anymore; 
+            # we wait for the full sync to finish.
+
+    def _on_full_sync_request(self, data):
+        """Host: a new peer asked for the full scene — serialize and send in batches."""
+        if not self.collab.is_hosting or not self.collab.is_active:
+            return
+        
+        logger.info('[collab] Host starting batched full sync delivery...')
+        self.collab.broadcast_sync_start()
+        
+        # Capture all relevant scene items
+        items_to_sync = [item for item in self.scene.items() 
+                         if hasattr(item, 'ensure_collab_id') and hasattr(item, 'TYPE')]
+        
+        item_count = len(items_to_sync)
+        current_idx = 0
+        batch_size = 10 # Faster batches for better performance
+
+        def send_next_batch():
+            nonlocal current_idx
+            if not self.collab.is_hosting or not self.collab.is_active:
+                return
+
+            end_idx = min(current_idx + batch_size, item_count)
+            for i in range(current_idx, end_idx):
+                item = items_to_sync[i]
+                cid = item.ensure_collab_id()
+                self.collab.register_item(cid, item)
+                
+                try:
+                    item_type = getattr(item, 'TYPE', 'unknown')
+                    item_data = {}
+                    
+                    if item_type == 'pixmap':
+                        data_bytes, _ = item.pixmap_to_bytes(apply_grayscale=True, apply_crop=True)
+                        item_data = {
+                            'image_bytes': data_bytes,
+                            'filename': getattr(item, 'filename', None),
+                            'x': item.pos().x(), 'y': item.pos().y(),
+                            'scale': item.scale(), 'rotation': item.rotation(),
+                            'z': item.zValue(),
+                        }
+                    elif item_type == 'text':
+                        item_data = {
+                            'text': item.toPlainText(),
+                            'x': item.pos().x(), 'y': item.pos().y(),
+                            'scale': item.scale(), 'rotation': item.rotation(),
+                            'z': item.zValue(),
+                        }
+                    elif item_type == 'video':
+                        pixmap = item.pixmap()
+                        data_bytes = QtCore.QByteArray()
+                        if pixmap and not pixmap.isNull():
+                            buf = QtCore.QBuffer(data_bytes)
+                            buf.open(QtCore.QIODevice.OpenModeFlag.WriteOnly)
+                            pixmap.save(buf, "PNG")
+                        
+                        item_data = {
+                            'filename': getattr(item, 'filename', ''),
+                            'image_bytes': data_bytes.data(),
+                            'x': item.pos().x(), 'y': item.pos().y(),
+                            'scale': item.scale(), 'rotation': item.rotation(),
+                            'z': item.zValue(),
+                        }
+                    elif item_type in ('doodle', 'shape'):
+                        item_data = item.get_extra_save_data() | {
+                            'x': item.pos().x(), 'y': item.pos().y(),
+                            'z': item.zValue(),
+                        }
+                        if item_type == 'shape':
+                            item_data.update({
+                                'scale': item.scale(),
+                                'rotation': item.rotation(),
+                            })
+                    else:
+                        continue
+
+                    # Send item through client
+                    msg = protocol.make_item_added_msg(
+                        self.collab._client.user_id, cid, item_type, item_data)
+                    self.collab._client.emit(protocol.ITEM_ADDED, msg)
+                except Exception as e:
+                    logger.warning(f'[collab] Failed to sync item {cid}: {e}')
+            
+            current_idx = end_idx
+            if current_idx < item_count:
+                # Stagger delivery to prevent socket disconnects
+                QtCore.QTimer.singleShot(5, send_next_batch)
+            else:
+                self.collab.broadcast_sync_end()
+                logger.info(f'[collab] Host finished batched sync: {item_count} items sent')
+
+        send_next_batch()
+
+    def _on_full_sync_response(self, data):
+        """Joiner: received full scene snapshot — rebuild scene step-by-step."""
+        items = data.get('items', [])
+        if not items:
+            if hasattr(self, 'welcome_overlay'):
+                self.welcome_overlay.hide_loading()
+                self.welcome_overlay.hide()
+            
+            # Reveal status pill if session is active but scene was empty
+            if self.collab.is_active:
+                self.collab_status.show()
+            return
+
+        logger.info(f'[collab] Queuing full sync: {len(items)} items')
+        self._is_receiving_sync = True
+        self.collab.begin_remote_apply()
+        self.scene.clear()
+        
+        for item_data in items:
+            self._apply_remote_item_added(item_data)
+        
+        self.collab.end_remote_apply()
+
+    def _apply_remote_sync_start(self, data):
+        """Joiner: host is starting a chunked sync delivery."""
+        logger.info('[collab] Receiving chunked sync...')
+        self._is_receiving_sync = True
+        self.collab.begin_remote_apply()
+        self.scene.clear()
+
+    def _apply_remote_sync_end(self, data):
+        """Joiner: host finished chunked sync delivery."""
+        logger.info('[collab] Chunked sync finished')
+        # We don't hide the overlay here because items might still be in the queue.
+        # _process_remote_queue will handle hiding when the queue is drained.
+        self.collab.end_remote_apply()
+
 
     def on_action_facing_problem(self):
         QtGui.QDesktopServices.openUrl(
@@ -978,7 +1691,8 @@ class BeeGraphicsView(MainControlsMixin,
         self.progress = widgets.BeeProgressDialog(
             'Fetching & loading images…',
             worker=self.worker,
-            parent=self)
+            parent=self,
+            title=constants.APPNAME)
         self.worker.start()
 
     def do_insert_videos(self, urls, pos=None):
@@ -1028,11 +1742,20 @@ class BeeGraphicsView(MainControlsMixin,
         self.do_insert_images(filenames)
 
     def on_action_insert_text(self):
+        logger.info('=== on_action_insert_text called ===')
         self.cancel_active_modes()
-        item = BeeTextItem()
-        pos = self.mapToScene(self.mapFromGlobal(self.cursor().pos()))
-        item.setScale(1 / self.get_scale())
-        self.undo_stack.push(commands.InsertItems(self.scene, [item], pos))
+        try:
+            item = BeeTextItem()
+            logger.info(f'BeeTextItem created: {item}')
+            pos = self.mapToScene(self.mapFromGlobal(self.cursor().pos()))
+            logger.info(f'Insert position: {pos}')
+            scale = self.get_scale()
+            logger.info(f'View scale: {scale}')
+            item.setScale(1 / scale)
+            self.undo_stack.push(commands.InsertItems(self.scene, [item], pos))
+            logger.info('InsertItems pushed to undo stack')
+        except Exception as e:
+            logger.error(f'Error in on_action_insert_text: {e}', exc_info=True)
 
     def on_action_copy(self):
         logger.debug('Copying to clipboard...')
@@ -1094,28 +1817,60 @@ class BeeGraphicsView(MainControlsMixin,
             QtCore.QUrl.fromLocalFile(dirname))
 
     def on_selection_changed(self):
-        logger.debug('Currently selected items: %s',
-                     len(self.scene.selectedItems(user_only=True)))
-        self.actiongroup_set_enabled('active_when_selection',
-                                     self.scene.has_selection())
-        self.actiongroup_set_enabled('active_when_single_selection',
-                                     self.scene.has_single_selection())
-        self.actiongroup_set_enabled('active_when_single_image',
-                                     self.scene.has_single_image_selection())
+        try:
+            logger.debug('Currently selected items: %s',
+                         len(self.scene.selectedItems(user_only=True)))
+            self.actiongroup_set_enabled('active_when_selection',
+                                         self.scene.has_selection())
+            self.actiongroup_set_enabled('active_when_single_selection',
+                                         self.scene.has_single_selection())
+            self.actiongroup_set_enabled('active_when_single_image',
+                                         self.scene.has_single_image_selection())
 
-        if self.scene.has_selection():
-            item = self.scene.selectedItems(user_only=True)[0]
-            grayscale = getattr(item, 'grayscale', False)
-            bee_actions['grayscale'].qaction.setChecked(grayscale)
-        self.viewport().repaint()
+            if self.scene.has_selection():
+                item = self.scene.selectedItems(user_only=True)[0]
+                grayscale = getattr(item, 'grayscale', False)
+                bee_actions['grayscale'].qaction.setChecked(grayscale)
+            self.viewport().repaint()
+        except RuntimeError:
+            # The underlying C++ scene object might have been deleted during shutdown
+            pass
 
     def on_cursor_changed(self, cursor):
+        # Only block cursor change when the VIEW itself has an active mode
+        # (pan, zoom, sample color). Never block cursor for scene-level item
+        # interactions (move/rubberband) since that prevents hover resize cursors.
         if self.active_mode is None:
             self.viewport().setCursor(cursor)
 
     def on_cursor_cleared(self):
         if self.active_mode is None:
             self.viewport().unsetCursor()
+
+    def eventFilter(self, obj, event):
+        """Intercept viewport Enter events to clear the OS resize cursor.
+        
+        When the user resizes the application window and then moves back into
+        the canvas, the OS window-resize cursor stays visible until Qt refreshes
+        it. Catching QEvent.Enter on the viewport and calling unsetCursor() forces
+        Qt to re-evaluate hover events and restore the correct canvas cursor.
+        """
+        if obj is self.viewport() and event.type() == QtCore.QEvent.Type.Enter:
+            # SAFETY: Clear any stuck global override cursors (e.g. from frameless resize)
+            try:
+                while QtWidgets.QApplication.overrideCursor() is not None:
+                    QtWidgets.QApplication.restoreOverrideCursor()
+            except Exception:
+                pass
+                
+            # FORCE POKE: Manually toggle the cursor to force the OS to drop any 
+            # stuck resize symbols from native window interactions.
+            self.viewport().setCursor(QtCore.Qt.CursorShape.ArrowCursor)
+            QtCore.QTimer.singleShot(10, self.viewport().unsetCursor)
+            
+            if self.active_mode is None:
+                self.viewport().unsetCursor()
+        return super().eventFilter(obj, event)
 
     def recalc_scene_rect(self):
         """Resize the scene rectangle so that it is always one view width
@@ -1127,13 +1882,12 @@ class BeeGraphicsView(MainControlsMixin,
             return
         logger.trace('Recalculating scene rectangle...')
         try:
-            topleft = self.mapFromScene(
-                self.scene.itemsBoundingRect().topLeft())
+            bounds = self.scene.itemsBoundingRect()
+            topleft = self.mapFromScene(bounds.topLeft())
             topleft = self.mapToScene(QtCore.QPoint(
                 topleft.x() - self.size().width(),
                 topleft.y() - self.size().height()))
-            bottomright = self.mapFromScene(
-                self.scene.itemsBoundingRect().bottomRight())
+            bottomright = self.mapFromScene(bounds.bottomRight())
             bottomright = self.mapToScene(QtCore.QPoint(
                 bottomright.x() + self.size().width(),
                 bottomright.y() + self.size().height()))
@@ -1154,17 +1908,33 @@ class BeeGraphicsView(MainControlsMixin,
             arguments and turns it into a number, for ex. ``min`` or ``max``.
         """
 
-        topleft = self.mapFromScene(
-            self.scene.itemsBoundingRect().topLeft())
-        bottomright = self.mapFromScene(
-            self.scene.itemsBoundingRect().bottomRight())
+        bounds = self.scene.itemsBoundingRect()
+        topleft = self.mapFromScene(bounds.topLeft())
+        bottomright = self.mapFromScene(bounds.bottomRight())
         return func(bottomright.x() - topleft.x(),
                     bottomright.y() - topleft.y())
 
-    def scale(self, *args, **kwargs):
-        super().scale(*args, **kwargs)
-        self.scene.on_view_scale_change()
-        self.recalc_scene_rect()
+    def scale(self, sx, sy):
+        super().scale(sx, sy)
+        # Invalidate geometry for all selected items to refresh their screen-space
+        # hit zones (boundingRect/shape) at the new zoom level.
+        if self.scene:
+            self.scene._updating_scene = True
+            try:
+                for item in self.scene.selectedItems():
+                    if hasattr(item, 'prepareGeometryChange'):
+                        item.prepareGeometryChange()
+                if hasattr(self.scene, 'multi_select_item'):
+                    self.scene.multi_select_item.prepareGeometryChange()
+                self.scene.on_view_scale_change()
+            finally:
+                self.scene._updating_scene = False
+                # Manually enforce one single layout reset after zoom
+                if self.scene.has_multi_selection() and self.scene.multi_select_item.scene():
+                    self.scene.multi_select_item.fit_selection_area(
+                        self.scene.itemsBoundingRect(selection_only=True))
+                        
+        self._schedule_recalc_scene_rect()
 
     def get_scale(self):
         return self.transform().m11()
@@ -1307,6 +2077,7 @@ class BeeGraphicsView(MainControlsMixin,
 
         if self.mouseMoveEventMainControls(event):
             return
+
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
@@ -1327,19 +2098,36 @@ class BeeGraphicsView(MainControlsMixin,
     def resizeEvent(self, event):
         super().resizeEvent(event)
         try:
-            self.recalc_scene_rect()
+            self._schedule_recalc_scene_rect()
         except Exception:
             pass
+        
+        # Overlays: welcome and cursors
+        viewport = self.viewport()
+        vw, vh = viewport.width(), viewport.height()
+        
         try:
             if hasattr(self, 'welcome_overlay') and self.welcome_overlay is not None:
-                self.welcome_overlay.resize(self.size())
-                # Re-center floating widget if visible
-                if self.welcome_overlay.isVisible() and hasattr(self.welcome_overlay, 'floating_widget'):
-                    parent_rect = self.rect()
-                    widget_rect = self.welcome_overlay.floating_widget.geometry()
-                    x = (parent_rect.width() - widget_rect.width()) // 2
-                    y = (parent_rect.height() - widget_rect.height()) // 2
-                    self.welcome_overlay.floating_widget.move(x, y)
+                self.welcome_overlay.setGeometry(self.rect())
+                self.welcome_overlay.update_visibility()
+        except Exception:
+            pass
+        
+        try:
+            if hasattr(self, 'cursor_overlay') and self.cursor_overlay is not None:
+                self.cursor_overlay.setGeometry(0, 0, vw, vh)
+        except Exception:
+            pass
+
+        # UI Components: collab status, toolbars
+        try:
+            if hasattr(self, 'collab_status') and self.collab_status is not None:
+                # Bottom-right corner offset
+                right_margin = 20
+                bottom_margin = 20
+                cw = self.collab_status.width()
+                ch = self.collab_status.height()
+                self.collab_status.move(self.width() - cw - right_margin, self.height() - ch - bottom_margin)
         except Exception:
             pass
         try:
@@ -1348,6 +2136,12 @@ class BeeGraphicsView(MainControlsMixin,
                     self._hierarchy_overlay.update_position()
         except Exception:
             pass
+        
+        if hasattr(self, '_text_toolbar') and self._text_toolbar.isVisible():
+            self._text_toolbar._position_above_item()
+        if hasattr(self, '_doodle_toolbar') and self._doodle_toolbar and self._doodle_toolbar.isVisible():
+            self._doodle_toolbar.position_in_view()
+
         try:
             self.update_watermark_pos()
         except Exception:
@@ -1361,16 +2155,78 @@ class BeeGraphicsView(MainControlsMixin,
         # Watermark removed per user request
         pass
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self.scene.items():
+            self.welcome_overlay.setGeometry(self.rect())
+            self.welcome_overlay.raise_()
+            self.welcome_overlay.update_visibility()
+            self.welcome_overlay.update()
+            self.welcome_overlay.show()
+
     def keyPressEvent(self, event):
         if self.keyPressEventMainControls(event):
             return
+
+        ctrl_shift = Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier
+        
+        # Doodle Mode Toggle
+        if event.key() == Qt.Key.Key_D and event.modifiers() == ctrl_shift:
+            if self.scene.active_mode in (self.scene.DRAW_MODE, self.scene.ERASE_MODE):
+                self.scene.active_mode = None
+                self.doodle_toolbar.hide()
+                from threecolref import widgets
+                widgets.BeeNotification(self, 'Exited Draw Mode')
+                self.viewport().unsetCursor()
+            else:
+                self.scene.active_mode = self.scene.DRAW_MODE
+                try:
+                    self.doodle_toolbar.position_in_view()
+                    self.doodle_toolbar.pencil_btn.setChecked(True)
+                except Exception as e:
+                    logger.error(f'Error showing doodle toolbar: {e}', exc_info=True)
+                from threecolref import widgets
+                widgets.BeeNotification(self, 'Entered Draw Mode (Doodle!)')
+                self.viewport().setCursor(Qt.CursorShape.CrossCursor)
+            event.accept()
+            return
+
+        # Switch to Pencil
+        if event.key() == Qt.Key.Key_P and event.modifiers() == ctrl_shift:
+            if self.scene.active_mode in (self.scene.DRAW_MODE, self.scene.ERASE_MODE):
+                self.scene.active_mode = self.scene.DRAW_MODE
+                self.doodle_toolbar.pencil_btn.setChecked(True)
+                self.viewport().setCursor(Qt.CursorShape.CrossCursor)
+                event.accept()
+                return
+
+        # Switch to Eraser
+        if event.key() == Qt.Key.Key_E and event.modifiers() == ctrl_shift:
+            if self.scene.active_mode in (self.scene.DRAW_MODE, self.scene.ERASE_MODE):
+                self.scene.active_mode = self.scene.ERASE_MODE
+                self.doodle_toolbar.eraser_btn.setChecked(True)
+                self.viewport().setCursor(Qt.CursorShape.ForbiddenCursor)
+                event.accept()
+                return
+
+        # Escape to exit modes
+        if self.scene.active_mode in (self.scene.DRAW_MODE, self.scene.ERASE_MODE) and event.key() == Qt.Key.Key_Escape:
+            self.scene.active_mode = None
+            self.doodle_toolbar.hide()
+            self.viewport().unsetCursor()
+            event.accept()
+            return
+
         if self.active_mode == self.SAMPLE_COLOR_MODE:
             self.cancel_sample_color_mode()
             event.accept()
             return
+
         super().keyPressEvent(event)
 
-class BeeMainWidget(QtWidgets.QWidget):
+
+
+class BeeMainWidget(QtWidgets.QFrame):
     """Container for integrated title bar and graphics view."""
 
     def __init__(self, app, main_window):
@@ -1378,37 +2234,31 @@ class BeeMainWidget(QtWidgets.QWidget):
         self.app = app
         self.main_window = main_window
 
+        # Apply a dark border so frameless windows don't blend together
+        self.setObjectName("BeeMainWidget")
+        self.setStyleSheet("#BeeMainWidget { border: 1px solid #000000; }")
+
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Graphics view takes full space
-        self.view = BeeGraphicsView(app, main_window)
-        layout.addWidget(self.view)
-
-        # Title bar overlays on top (bubble-style, doesn't push UI when it expands)
+        # Title bar at top (in layout flow so view starts below it)
         from threecolref.widgets import BeeTitleBar
-
+        self.view = BeeGraphicsView(app, main_window)
         self.title_bar = BeeTitleBar(self, self.view)
-        self.title_bar.setParent(self)
-        self.title_bar.raise_()
+        layout.addWidget(self.title_bar)
+
+        # Graphics view fills remaining space
+        layout.addWidget(self.view, 1)
 
         # Keep pin button in sync with "Always On Top" action
         from threecolref.actions.actions import bee_actions
-
         bee_actions['always_on_top'].qaction.toggled.connect(
             self.title_bar.controls.update_states
         )
-        # Initialise pin state based on current action state
         self.title_bar.controls.update_states()
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        # Keep title bar overlay at top, full width
-        self.title_bar.setGeometry(0, 0, self.width(), self.title_bar.height())
-
     def mouseDoubleClickEvent(self, event):
-        # Double-click compact window to restore (PureRef-style)
         if (hasattr(self.main_window, '_is_compact') and self.main_window._is_compact and
                 event.button() == QtCore.Qt.MouseButton.LeftButton):
             self.main_window._restore_from_compact()

@@ -144,6 +144,27 @@ tesint
 
 # Local env
 lmao
-error.log
 *.reg
 website/
+
+# Diagnostic and Debugging
+diag_app.py
+diag_app_v*.py
+check_attr.py
+check_mro_file.py
+run_crash.py
+test_autosave_debug.py
+test_autosave.py
+mro_check.txt
+diag_v4_out.txt
+diag_v4_utf8.txt
+crash.txt
+crash_log.txt
+startup_diag.log
+startup_error.log
+verbose.log
+verbose_crash.log
+crash_out.log
+crash_v*.log
+diag_output*.log
+*.log

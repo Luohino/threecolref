@@ -190,30 +190,35 @@ class SQLiteIO:
     def read(self):
         rows = self.fetchall(
             'SELECT items.id, type, x, y, z, scale, rotation, flip, '
-            'items.data, sqlar.data '
+            'items.data, sqlar.data, parent_id '
             'FROM sqlar JOIN items on sqlar.item_id = items.id')
         # Avoid OUTER JOIN for performance reasons; fetch text items
         # separately instead
         rows.extend(self.fetchall(
             'SELECT items.id, type, x, y, z, scale, rotation, flip, '
-            ' items.data, null as data '
+            ' items.data, null as data, parent_id '
             'FROM items '
-            'WHERE items.type = "text"'))
+            'WHERE items.type IN ("text", "doodle")'))
         if self.worker:
             self.worker.begin_processing.emit(len(rows))
 
         for i, row in enumerate(rows):
-            data = {
-                'save_id': row[0],
-                'type': row[1],
-                'x': row[2],
-                'y': row[3],
-                'z': row[4],
-                'scale': row[5],
-                'rotation': row[6],
-                'flip': row[7],
-                'data': json.loads(row[8]),
-            }
+            logger.debug(f'Processing row {i}: type={row[1]}, id={row[0]}')
+            try:
+                data = {
+                    'save_id': row[0],
+                    'type': row[1],
+                    'x': row[2],
+                    'y': row[3],
+                    'z': row[4],
+                    'scale': row[5],
+                    'rotation': row[6],
+                    'flip': row[7],
+                    'data': json.loads(row[8]) if row[8] else {},
+                }
+            except Exception as e:
+                logger.error(f'Failed to parse JSON for item {row[0]}: {e}')
+                continue
 
             if data['type'] == 'pixmap':
                 item = BeePixmapItem(QtGui.QImage())
@@ -243,6 +248,7 @@ class SQLiteIO:
                     os.close(temp_fd)
                     logger.error(f'Failed to load video: {e}')
 
+            data['parent_id'] = row[10]
             self.scene.add_item_later(data)
 
             if self.worker:
@@ -324,10 +330,11 @@ class SQLiteIO:
     def insert_item(self, item):
         self.ex(
             'INSERT INTO items (type, x, y, z, scale, rotation, flip, '
-            'data) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            'parent_id, data) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (item.TYPE, item.pos().x(), item.pos().y(), item.zValue(),
              item.scale(), item.rotation(), item.flip(),
+             item.parentItem().save_id if item.parentItem() else None,
              json.dumps(item.get_extra_save_data())))
         item.save_id = self.cursor.lastrowid
 
@@ -356,10 +363,11 @@ class SQLiteIO:
         """
         self.ex(
             'UPDATE items SET x=?, y=?, z=?, scale=?, rotation=?, flip=?, '
-            'data=? '
+            'parent_id=?, data=? '
             'WHERE id=?',
             (item.pos().x(), item.pos().y(), item.zValue(), item.scale(),
              item.rotation(), item.flip(),
+             item.parentItem().save_id if item.parentItem() else None,
              json.dumps(item.get_extra_save_data()),
              item.save_id))
         self.connection.commit()

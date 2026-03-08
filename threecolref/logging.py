@@ -37,11 +37,29 @@ logging.setLoggerClass(BeeLogger)
 
 
 class BeeRotatingFileHandler(logging.handlers.RotatingFileHandler):
-    """RotatingFileHandler that creates log directory if necessary."""
+    """RotatingFileHandler that creates log directory if necessary and 
+    gracefully handles log rotation errors on Windows (PermissionError).
+    """
 
     def __init__(self, filename, **kwargs):
         os.makedirs(os.path.dirname(filename), exist_ok=True)
         super().__init__(filename, **kwargs)
+
+    def doRollover(self):
+        try:
+            super().doRollover()
+        except (PermissionError, OSError):
+            # On Windows, rotation fails if another process has the log open.
+            # We ignore it to prevent the whole app from crashing.
+            pass
+
+    def emit(self, record):
+        try:
+            super().emit(record)
+        except (PermissionError, OSError):
+            # Same for emission if file is temporarily locked
+            pass
+
 
 
 qtlogger = logging.getLogger('Qt')
