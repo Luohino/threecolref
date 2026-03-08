@@ -41,11 +41,12 @@ Then run ``threecolref``
 Features
 --------
 
-* Move, scale, rotate, crop and flip images
-* Mass-scale images to the same width, height or size
-* Mass-arrange images vertically, horizontally or for optimal usage of space
-* Add text notes
-* Enable always-on-top-mode and disable the title bar:
+* **Live Cloud Collaboration**: Share your workspace in real-time. Generate a secure cloud code to let peers instantly view your scene, see your cursor, and watch live crop/scale transformations.
+* **Premium Interaction**: Move, scale, rotate, crop, and flip your reference images with smooth, intuitive controls.
+* **Intelligent Arrangement**: Mass-scale images to the same width, height, or size, or automatically arrange them vertically, horizontally, or for optimal space.
+* **Minimalist Workspace**: Enable always-on-top mode and disable the title bar so 3ColRef floats unobtrusively above your canvas.
+* **Visual History**: A reimagined welcome screen featuring vertical cards and live scene thumbnails for effortless project management.
+* Add text notes and links directly into your scene. 
 
 
 
