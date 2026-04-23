@@ -12,4 +12,4 @@ jobs:
     steps:
       - name: Ping Render Server
         run: |
-          curl -s -f https://.com/ping || echo "Server wake-up triggered"
+          curl -s -f https://threecolref-server.onrender.com/ping || echo "Server wake-up triggered"

@@ -40,7 +40,7 @@ CHANGELOG_URL = f'{WEBSITE}/changelog'
 # Security: COLLAB_SERVER_URL is loaded from .env if it exists.
 # For local convenience, the default is set to your Render URL.
 # WARNING: DO NOT COMMIT THIS FILE IF THE URL BELOW IS PRIVATE!
-COLLAB_SERVER_URL = os.environ.get('COLLAB_SERVER_URL', 'https://.com')
+COLLAB_SERVER_URL = os.environ.get('COLLAB_SERVER_URL', 'https://threecolref-server.onrender.com')
 
 CHANGED_SYMBOL = '•'
 

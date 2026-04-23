@@ -38,7 +38,7 @@ def build():
         
         # Replace the env loader with the hardcoded real URL
         new_content = content.replace(
-            "os.environ.get('COLLAB_SERVER_URL', 'https://.com')",
+            "os.environ.get('COLLAB_SERVER_URL', 'https://threecolref-server.onrender.com')",
             f"'{real_url}'"
         )
         
